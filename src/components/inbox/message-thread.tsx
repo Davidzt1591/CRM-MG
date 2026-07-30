@@ -27,10 +27,15 @@ import {
   RefreshCw,
   PanelRightOpen,
   PanelRightClose,
+  Layers,
+  Loader2,
 } from "lucide-react";
 import { format, isToday, isYesterday, differenceInHours } from "date-fns";
 import { useTranslations } from "next-intl";
 import { Badge } from "@/components/ui/badge";
+import { Textarea } from "@/components/ui/textarea";
+import { Label } from "@/components/ui/label";
+import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -38,6 +43,22 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  Dialog,
+  DialogPortal,
+  DialogOverlay,
+  DialogContent,
+  DialogTitle,
+  DialogDescription,
+  DialogClose,
+} from "@/components/ui/dialog";
+import {
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from "@/components/ui/select";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { MessageBubble } from "./message-bubble";
 import { MessageActions } from "./message-actions";
@@ -838,6 +859,68 @@ export function MessageThread({
     [conversation, onAssignChange],
   );
 
+  // ── Transfer dialog state ─────────────────────────────────
+  const [transferOpen, setTransferOpen] = useState(false);
+  const [transferDepts, setTransferDepts] = useState<
+    { id: string; name: string }[]
+  >([]);
+  const [selectedTransferDept, setSelectedTransferDept] = useState("");
+  const [transferNote, setTransferNote] = useState("");
+  const [transferring, setTransferring] = useState(false);
+
+  // Load departments for transfer dialog
+  useEffect(() => {
+    if (!transferOpen) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/departments");
+        if (!res.ok) return;
+        const json = await res.json();
+        if (!cancelled) setTransferDepts(json.departments ?? []);
+      } catch {
+        // Silently fail
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [transferOpen]);
+
+  const handleTransfer = useCallback(async () => {
+    if (!conversation || !selectedTransferDept) return;
+    setTransferring(true);
+    try {
+      const res = await fetch(
+        `/api/conversations/${conversation.id}/transfer`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            departmentId: selectedTransferDept,
+            note: transferNote.trim() || undefined,
+          }),
+        },
+      );
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: "Failed" }));
+        throw new Error(err.error);
+      }
+      toast.success(t("transferSuccess"));
+      setTransferOpen(false);
+      setSelectedTransferDept("");
+      setTransferNote("");
+      // Force a refresh so the department badge updates
+      if (onRefresh) onRefresh();
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : t("transferError"),
+      );
+    } finally {
+      setTransferring(false);
+    }
+  }, [conversation, selectedTransferDept, transferNote, onRefresh, t]);
+
   // Empty state — same WhatsApp-style doodle background as the active
   // thread below, so swapping between empty/selected doesn't change the
   // pattern under the user's eye.
@@ -1054,8 +1137,97 @@ export function MessageThread({
               )}
             </DropdownMenuContent>
           </DropdownMenu>
+
+          {/* Transfer button */}
+          <button
+            type="button"
+            onClick={() => setTransferOpen(true)}
+            aria-label={t("transfer")}
+            title={t("transfer")}
+            className="inline-flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+          >
+            <Layers className="h-3.5 w-3.5" />
+          </button>
         </div>
       </div>
+
+      {/* Transfer dialog */}
+      <Dialog open={transferOpen} onOpenChange={setTransferOpen}>
+        <DialogPortal>
+          <DialogOverlay />
+          <DialogContent>
+            <DialogTitle>{t("transferTo")}</DialogTitle>
+            <DialogDescription>
+              {t("transferDepartment")}
+            </DialogDescription>
+            <div className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="transfer-dept">
+                  {t("transferDepartment")}
+                </Label>
+                <Select
+                  value={selectedTransferDept}
+                  onValueChange={(value) => setSelectedTransferDept(value ?? "")}
+                >
+                  <SelectTrigger
+                    id="transfer-dept"
+                    className="border-border bg-muted"
+                  >
+                    <SelectValue placeholder={t("selectDepartment")} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {transferDepts.length === 0 ? (
+                      <div className="px-3 py-2 text-sm text-muted-foreground">
+                        {t("noDepartments")}
+                      </div>
+                    ) : (
+                      transferDepts.map((dept) => (
+                        <SelectItem key={dept.id} value={dept.id}>
+                          {dept.name}
+                        </SelectItem>
+                      ))
+                    )}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="transfer-note">
+                  {t("transferNote")}
+                </Label>
+                <Textarea
+                  id="transfer-note"
+                  value={transferNote}
+                  onChange={(e) => setTransferNote(e.target.value)}
+                  placeholder={t("transferNotePlaceholder")}
+                  rows={3}
+                  maxLength={500}
+                  className="border-border bg-muted"
+                />
+              </div>
+
+              <div className="flex items-center justify-end gap-2">
+                <Button
+                  variant="outline"
+                  disabled={transferring}
+                  onClick={() => setTransferOpen(false)}
+                >
+                  {t("cancel")}
+                </Button>
+                <Button
+                  onClick={handleTransfer}
+                  disabled={!selectedTransferDept || transferring}
+                >
+                  {transferring && (
+                    <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+                  )}
+                  {t("transferConfirm")}
+                </Button>
+              </div>
+            </div>
+          </DialogContent>
+        </DialogPortal>
+      </Dialog>
 
       {/* Messages Area */}
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4">
