@@ -9,7 +9,7 @@ import {
 } from "@/lib/inbox/conversations";
 import { cn } from "@/lib/utils";
 import type { Conversation, ConversationStatus, Tag } from "@/types";
-import { Search, ChevronDown, X } from "lucide-react";
+import { Search, ChevronDown, X, Layers } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 import { useTranslations } from "next-intl";
 import { Input } from "@/components/ui/input";
@@ -72,6 +72,13 @@ export function ConversationList({
   const [tags, setTags] = useState<Tag[]>([]);
   const [selectedTagIds, setSelectedTagIds] = useState<string[]>([]);
   const [selectedCompany, setSelectedCompany] = useState<string | null>(null);
+  // Department filter — loaded from the API so RLS scopes the results.
+  const [departments, setDepartments] = useState<
+    { id: string; name: string }[]
+  >([]);
+  const [selectedDepartmentId, setSelectedDepartmentId] = useState<
+    string | null
+  >(null);
 
   // Keep the latest callback in a ref so the fetch effect below can
   // have a stable, empty-dep identity. Previously the fetch useCallback
@@ -140,6 +147,25 @@ export function ConversationList({
     };
   }, []);
 
+  // Fetch departments the caller can see — admins see all, agents see assigned.
+  // Used for the department filter dropdown below.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/departments");
+        if (!res.ok) return;
+        const json = await res.json();
+        if (!cancelled) setDepartments(json.departments ?? []);
+      } catch {
+        // Silently ignore — the filter just won't appear.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // Company options are derived from the loaded conversations — there's no
   // separate companies table, and only companies with a live conversation
   // are worth offering as an inbox filter.
@@ -174,6 +200,13 @@ export function ConversationList({
           tagIds: selectedTagIds,
           company: selectedCompany,
         })
+      );
+    }
+
+    // Department filter.
+    if (selectedDepartmentId) {
+      result = result.filter(
+        (c) => c.department_id === selectedDepartmentId,
       );
     }
 
@@ -345,6 +378,59 @@ export function ConversationList({
                     )}
                   >
                     <span className="truncate">{co}</span>
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+
+          {/* Department filter — shown only when departments exist */}
+          {departments.length > 0 && (
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                className={cn(
+                  "inline-flex max-w-40 items-center justify-center h-7 gap-1 px-2 text-xs rounded-md hover:bg-muted",
+                  selectedDepartmentId
+                    ? "text-primary"
+                    : "text-muted-foreground hover:text-foreground"
+                )}
+              >
+                <Layers className="h-3 w-3 shrink-0" />
+                <span className="truncate">
+                  {selectedDepartmentId
+                    ? departments.find((d) => d.id === selectedDepartmentId)
+                        ?.name ?? t("department")
+                    : t("department")}
+                </span>
+                <ChevronDown className="h-3 w-3 shrink-0" />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                align="start"
+                className="max-h-64 w-56 border-border bg-popover"
+              >
+                <DropdownMenuItem
+                  onClick={() => setSelectedDepartmentId(null)}
+                  className={cn(
+                    "text-sm",
+                    selectedDepartmentId === null
+                      ? "text-primary"
+                      : "text-popover-foreground"
+                  )}
+                >
+                  {t("allDepartments")}
+                </DropdownMenuItem>
+                {departments.map((dept) => (
+                  <DropdownMenuItem
+                    key={dept.id}
+                    onClick={() => setSelectedDepartmentId(dept.id)}
+                    className={cn(
+                      "text-sm",
+                      selectedDepartmentId === dept.id
+                        ? "text-primary"
+                        : "text-popover-foreground"
+                    )}
+                  >
+                    <span className="truncate">{dept.name}</span>
                   </DropdownMenuItem>
                 ))}
               </DropdownMenuContent>
