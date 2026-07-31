@@ -261,6 +261,13 @@ export const RATE_LIMITS = {
    *  capping a stampede; excess inbounds simply don't get an auto-reply
    *  (they still land in the inbox for a human). */
   aiAutoReplyAccount: { limit: 30, windowMs: 60_000 },
+  /** CSP violation reports, per IP. The endpoint is unauthenticated
+   *  (browsers don't send credentials with reports), so the IP is the
+   *  only handle — 60/min is far above what real browsers emit (a few
+   *  per page load at most) while capping a junk-report flood. The
+   *  route also caps the body at 100 KB, so this budget is what stops
+   *  the endpoint from becoming a free log-spam / CPU sink. */
+  cspReport: { limit: 60, windowMs: 60_000 },
 } as const;
 
 /** Test-only helper. Clears the in-memory state so unit tests don't
