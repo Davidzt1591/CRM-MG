@@ -1,4 +1,3 @@
-import crypto from 'node:crypto';
 import { createServerClient } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
 import { canAccessAdmin, type AccountRole } from '@/lib/auth/roles'
@@ -6,7 +5,11 @@ import { canAccessAdmin, type AccountRole } from '@/lib/auth/roles'
 export async function middleware(request: NextRequest) {
   // Generate a per-request nonce for CSP enforcement.
   // Must be unique per request so attackers can't bypass via nonce-injection.
-  const nonce = crypto.randomUUID();
+  // Uses the Web Crypto API (globalThis.crypto.randomUUID) instead of
+  // node:crypto — the Edge runtime middleware deploys to does not bundle
+  // Node's built-in `crypto` module (MCRM-59 / D7). globalThis.crypto is
+  // available in both the Edge and Node runtimes, so behaviour is identical.
+  const nonce = globalThis.crypto.randomUUID();
 
   // Build the Content-Security-Policy with the nonce woven in.
   // Previously this was Report-Only in next.config.ts; now enforced here

@@ -1,6 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import crypto from 'node:crypto';
 import { NextRequest } from "next/server";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
+// Read the production middleware source at module load so the structural
+// Edge-compat assertions below (no node:crypto import) have something to
+// assert against. The test process itself runs in Node, which is why the
+// test file's own `crypto` import above is fine — only the *runtime*
+// middleware must stay Edge-safe (D7).
+const middlewareSource = readFileSync(
+  resolve(__dirname, "middleware.ts"),
+  "utf8",
+);
 
 // --- Scenario knobs the mock reads -----------------------------------------
 // `mockUser`         — what getUser() resolves to (a refreshed session ⇒ user,
@@ -367,5 +379,60 @@ describe("middleware — admin role gate (SEC-01 / MCRM-57)", () => {
 
     // No profile row ⇒ can't establish admin role ⇒ hard 403 (fail closed).
     expect(res.status).toBe(403);
+  });
+});
+
+// ============================================================
+// Edge-compatible nonce generation (MCRM-59 / D7)
+//
+// Next 16's Edge runtime (used by middleware) does NOT ship node:crypto,
+// so `import crypto from 'node:crypto'` raises a build warning and
+// breaks Edge deployments. The runtime contract that makes this
+// testable in a Node-based unit test is: the nonce must keep coming out
+// as a valid, unique UUID v4 (so CSP stays sound) while the source must
+// not reference node:crypto. There is no runtime-visible behavioural
+// difference between crypto.randomUUID() and globalThis.crypto.randomUUID()
+// — both yield UUID v4 — so the Edge-compat requirement is asserted
+// structurally on the source, and behavioural preservation is guarded
+// by the UUID format + uniqueness assertions.
+// ============================================================
+describe("middleware — Edge-compatible nonce (MCRM-59 / D7)", () => {
+  it("does not import node:crypto (Edge runtime unsupported)", () => {
+    // The real hazard is an actual `import ... from 'node:crypto'`, which
+    // would break the Edge runtime. A comment mentioning the module name is
+    // fine, so assert on the import shape rather than the bare substring.
+    const nodeCryptoImports = middlewareSource
+      .split("\n")
+      .map((line) => line.match(/^import\s+.*from\s*['"]node:crypto['"]/))
+      .filter(Boolean);
+    expect(nodeCryptoImports).toHaveLength(0);
+  });
+
+  it("generates the nonce via globalThis.crypto.randomUUID", () => {
+    expect(middlewareSource).toContain("globalThis.crypto.randomUUID");
+  });
+
+  it("produces a valid UUID v4 nonce on every request", async () => {
+    mockUser = { id: "user-1" };
+    const res = await middleware(new NextRequest("https://app.test/dashboard"));
+    const nonce = res.headers.get("x-nonce");
+    expect(nonce).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
+  });
+
+  it("emits a unique nonce across a burst of requests", async () => {
+    mockUser = { id: "user-1" };
+    const nonces = new Set<string>();
+    for (let i = 0; i < 25; i++) {
+      const res = await middleware(new NextRequest("https://app.test/dashboard"));
+      const n = res.headers.get("x-nonce");
+      // Real behaviour: each call to the generator yields a distinct UUID.
+      expect(n).toBeTruthy();
+      nonces.add(n as string);
+    }
+    // A collision here would mean the generator is not random enough to
+    // blind CSP nonces — the assertion fails loudly rather than guessing.
+    expect(nonces.size).toBe(25);
   });
 });
