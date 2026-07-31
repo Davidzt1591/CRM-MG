@@ -146,6 +146,7 @@ export async function POST(
     // Send notification to target department agents
     await notifyDepartmentAgents({
       supabase,
+      accountId: ctx.accountId,
       departmentId: body.departmentId,
       conversationId,
       actorUserId: ctx.userId,
@@ -164,22 +165,29 @@ export async function POST(
  */
 async function notifyDepartmentAgents({
   supabase,
+  accountId,
   departmentId,
   conversationId,
   actorUserId,
   note,
 }: {
   supabase: ReturnType<typeof createClient> extends Promise<infer T> ? T : never;
+  accountId: string;
   departmentId: string;
   conversationId: string;
   actorUserId: string;
   note?: string;
 }) {
   try {
-    // Fetch all profile IDs in the target department
+    // Fetch the auth.users id for every profile in the target
+    // department. profile_departments only knows profiles.id, but
+    // notifications.user_id references auth.users(id) — joining
+    // profiles is the only correct way to resolve recipients.
+    // PostgREST embeds the referenced row as an object, but the
+    // generated types can model it as an array; normalize both.
     const { data: members, error } = await supabase
       .from("profile_departments")
-      .select("profile_id")
+      .select("profile_id, profiles(user_id)")
       .eq("department_id", departmentId);
 
     if (error || !members?.length) return;
@@ -193,15 +201,32 @@ async function notifyDepartmentAgents({
 
     const departmentName = dept?.name ?? "Unknown";
 
-    const notifications = members.map((m) => ({
-      account_id: null, // Will be resolved by DB trigger or context
-      user_id: m.profile_id,
-      type: "conversation_assigned" as const,
-      conversation_id: conversationId,
-      actor_user_id: actorUserId,
-      title: `Conversation transferred to ${departmentName}`,
-      body: note ? `Note: ${note}` : null,
-    }));
+    const notifications = members
+      .map((m) => {
+        const embedded = m.profiles as
+          | { user_id?: string }
+          | Array<{ user_id?: string }>
+          | null
+          | undefined;
+        const recipientUserId = Array.isArray(embedded)
+          ? embedded[0]?.user_id
+          : embedded?.user_id;
+        return { profileId: m.profile_id as string, userId: recipientUserId };
+      })
+      .filter((m) => Boolean(m.userId))
+      .map((m) => ({
+        // Scenario C: account_id is NOT NULL — resolve it from the
+        // caller's session, never null.
+        account_id: accountId,
+        user_id: m.userId as string,
+        type: "conversation_assigned" as const,
+        conversation_id: conversationId,
+        actor_user_id: actorUserId,
+        title: `Conversation transferred to ${departmentName}`,
+        body: note ? `Note: ${note}` : null,
+      }));
+
+    if (notifications.length === 0) return;
 
     // Insert in bulk
     const { error: insertError } = await supabase
