@@ -1230,7 +1230,7 @@
       "tagsAndFields": "Etiquetas y campos personalizados",
       "tagsCount": "{count} {count, plural, =1 {etiqueta} other {etiquetas}}",
       "fieldsCount": "{count} {count, plural, =1 {campo personalizado} other {campos personalizados}}",
-      "appearance": "Modo {mode} · {theme}",
+      "appearance": "Modo {mode}",
       "yourAccount": "Tu cuenta",
       "loading": "Cargando…"
     },

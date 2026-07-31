@@ -1230,7 +1230,7 @@
       "tagsAndFields": "태그 및 커스텀 필드",
       "tagsCount": "태그 {count}개",
       "fieldsCount": "커스텀 필드 {count}개",
-      "appearance": "{mode} 모드 · {theme} 색상",
+      "appearance": "{mode} 모드",
       "yourAccount": "내 계정",
       "loading": "불러오는 중…"
     },
