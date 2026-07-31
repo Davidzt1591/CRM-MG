@@ -16,6 +16,13 @@ let refreshedCookies: Array<{
   options: Record<string, unknown>;
 }> = [];
 
+// `mockProfile`      — the profiles row returned for the user, i.e. the caller's
+//                      account_role. Drives the /admin/* server-side role gate:
+//                      null → no profile (forbidden), a non-admin role → 403,
+//                      owner/admin → pass-through.
+let mockProfile: { account_role: string } | null = null;
+let mockProfileError: unknown = null;
+
 vi.mock("@supabase/ssr", () => ({
   createServerClient: (
     _url: string,
@@ -28,10 +35,31 @@ vi.mock("@supabase/ssr", () => ({
       // Mirrors real auth-js: an expired access token is transparently
       // refreshed inside getUser(), which rotates the refresh token and
       // pushes the new cookies through setAll() before resolving.
-      getUser: async () => {
-        if (refreshedCookies.length) opts.cookies.setAll(refreshedCookies);
-        return { data: { user: mockUser } };
-      },
+       getUser: async () => {
+         if (refreshedCookies.length) opts.cookies.setAll(refreshedCookies);
+         return { data: { user: mockUser } };
+       },
+    },
+    // Profiles point-lookup backing the /admin/* role gate (SEC-01).
+    // Returns whatever `mockProfile` the scenario set; mirrors the real
+    // `.select(...).eq(...).maybeSingle()` shape the middleware calls.
+    from(_table: string) {
+      return {
+        select(_columns: string) {
+          return {
+            eq(_col: string, _val: unknown) {
+              return {
+                maybeSingle: async () => ({ data: mockProfile, error: mockProfileError }),
+                // Allow awaiting the builder directly (some routes do).
+                then: (onFulfilled: (v: unknown) => unknown) =>
+                  Promise.resolve({ data: mockProfile, error: mockProfileError }).then(
+                    onFulfilled,
+                  ),
+              };
+            },
+          };
+        },
+      };
     },
   }),
 }));
@@ -44,6 +72,8 @@ beforeEach(() => {
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = "anon-key";
   mockUser = null;
   refreshedCookies = [];
+  mockProfile = null;
+  mockProfileError = null;
 });
 
 afterEach(() => vi.clearAllMocks());
@@ -201,5 +231,141 @@ describe("middleware — refreshed auth cookies survive redirects", () => {
     // No redirect — the normal NextResponse.next() already carries cookies.
     expect(res.headers.get("location")).toBeNull();
     expect(res.cookies.get(ROTATED.name)?.value).toBe(ROTATED.value);
+  });
+});
+
+// ============================================================
+// SEC-01: server-side admin role gate for /admin/* (MCRM-57)
+//
+// The client-only redirect in src/app/admin/layout.tsx is NOT a
+// security boundary — it can be bypassed by navigating directly to a
+// /admin/* URL with a stolen session cookie. The middleware must
+// enforce the role server-side: authenticated non-admins get 403,
+// authenticated admins/owners pass through, and anonymous users keep
+// the existing /login redirect. /api/admin/* is intentionally NOT
+// gated here (route-level requireRole stays the boundary, D6).
+// ============================================================
+describe("middleware — admin role gate (SEC-01 / MCRM-57)", () => {
+  it("returns 403 for an authenticated member on /admin/*", async () => {
+    mockUser = { id: "user-member" };
+    mockProfile = { account_role: "viewer" };
+
+    const res = await middleware(
+      new NextRequest("https://app.test/admin/salesforce"),
+    );
+
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.error).toBe("Forbidden");
+  });
+
+  it("returns 403 for an agent (lowest non-admin role) on /admin/*", async () => {
+    mockUser = { id: "user-agent" };
+    mockProfile = { account_role: "agent" };
+
+    const res = await middleware(
+      new NextRequest("https://app.test/admin/departments"),
+    );
+
+    expect(res.status).toBe(403);
+  });
+
+  it("lets an admin pass through on /admin/* (no 403, no redirect)", async () => {
+    mockUser = { id: "user-admin" };
+    mockProfile = { account_role: "admin" };
+
+    const res = await middleware(
+      new NextRequest("https://app.test/admin/salesforce"),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("location")).toBeNull();
+  });
+
+  it("lets an owner pass through on /admin/*", async () => {
+    mockUser = { id: "user-owner" };
+    mockProfile = { account_role: "owner" };
+
+    const res = await middleware(new NextRequest("https://app.test/admin/audit-logs"));
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("location")).toBeNull();
+  });
+
+  it("redirects an anonymous user to /login (307) on /admin/*", async () => {
+    mockUser = null;
+    mockProfile = null;
+
+    const res = await middleware(
+      new NextRequest("https://app.test/admin/whatsapp"),
+    );
+
+    expect(res.status).toBe(307);
+    expect(res.headers.get("location")).toMatch(/\/login/);
+  });
+
+  it("does NOT 403 an authenticated member on a protected non-admin page", async () => {
+    mockUser = { id: "user-member" };
+    mockProfile = { account_role: "viewer" };
+
+    const res = await middleware(new NextRequest("https://app.test/dashboard"));
+
+    // /dashboard is protected (login gate) but not admin-scoped, so a
+    // member must reach it — the role gate must not over-gate.
+    expect(res.status).toBe(200);
+    expect(res.headers.get("location")).toBeNull();
+  });
+
+  it("does NOT 403 on /api/admin/* — page-only gate, routes keep their own requireRole", async () => {
+    mockUser = { id: "user-member" };
+    mockProfile = { account_role: "viewer" };
+
+    const res = await middleware(
+      new NextRequest("https://app.test/api/admin/audit-logs"),
+    );
+
+    // Middleware must pass /api/admin/* through (D6); the route layer is
+    // the boundary for API access, and it must not be shadowed here.
+    expect(res.status).toBe(200);
+    expect(res.headers.get("location")).toBeNull();
+  });
+
+  it("carries refreshed auth cookies onto the 403 response", async () => {
+    mockUser = { id: "user-member" };
+    mockProfile = { account_role: "viewer" };
+    refreshedCookies = [ROTATED];
+
+    const res = await middleware(
+      new NextRequest("https://app.test/admin/salesforce"),
+    );
+
+    // The rotated refresh token must survive the 403 (issue #288 pattern)
+    // otherwise an idle-then-active member wedges on a consumed token.
+    expect(res.status).toBe(403);
+    expect(res.cookies.get(ROTATED.name)?.value).toBe(ROTATED.value);
+  });
+
+  it("still emits CSP + x-nonce on the 403 response", async () => {
+    mockUser = { id: "user-member" };
+    mockProfile = { account_role: "viewer" };
+
+    const res = await middleware(
+      new NextRequest("https://app.test/admin/departments"),
+    );
+
+    expect(res.status).toBe(403);
+    expect(res.headers.get("Content-Security-Policy")).toMatch(/'nonce-/);
+    expect(res.headers.get("Report-To")).toContain("csp-endpoint");
+    expect(res.headers.get("x-nonce")).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  });
+
+  it("treats a missing profile as non-admin (403), not a bypass", async () => {
+    mockUser = { id: "user-orphan" };
+    mockProfile = null;
+
+    const res = await middleware(new NextRequest("https://app.test/admin/whatsapp"));
+
+    // No profile row ⇒ can't establish admin role ⇒ hard 403 (fail closed).
+    expect(res.status).toBe(403);
   });
 });

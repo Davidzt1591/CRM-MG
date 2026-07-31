@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { createServerClient } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
+import { canAccessAdmin, type AccountRole } from '@/lib/auth/roles'
 
 export async function middleware(request: NextRequest) {
   // Generate a per-request nonce for CSP enforcement.
@@ -127,6 +128,34 @@ export async function middleware(request: NextRequest) {
     const url = request.nextUrl.clone()
     url.pathname = '/login'
     return withRefreshedCookies(NextResponse.redirect(url))
+  }
+
+  // === SEC-01: server-side admin role gate for /admin/* (MCRM-57) ===
+  // Anonymous users are already redirected to /login above (protectedPaths
+  // includes '/admin'), so any user reaching this line is authenticated.
+  // The client-only redirect in src/app/admin/layout.tsx is defense-in-depth
+  // UX (hidden nav) only — it is NOT the security boundary. A member with a
+  // stolen session cookie can navigate straight to /admin/salesforce, so the
+  // role MUST be enforced server-side here. /api/admin/* is intentionally
+  // excluded: route-level requireRole() stays the API boundary (D6), and
+  // shadowing it here would risk an RLS 500 or double-gating.
+  if (user && request.nextUrl.pathname.startsWith('/admin')) {
+    const { data: profile, error } = await supabase
+      .from('profiles')
+      .select('account_role')
+      .eq('user_id', user.id)
+      .maybeSingle()
+    // Fail closed: a missing/error profile or a non-admin role ⇒ 403 JSON,
+    // NOT a hidden link. Rotated cookies ride along via withRefreshedCookies
+    // (issue #288 pattern) so an idle-then-active member doesn't wedge.
+    if (error || !profile || !canAccessAdmin(profile.account_role as AccountRole)) {
+      return withRefreshedCookies(
+        NextResponse.json(
+          { error: 'Forbidden', message: 'Admin access required' },
+          { status: 403 },
+        ),
+      )
+    }
   }
 
   // API routes that need auth (not webhooks)
