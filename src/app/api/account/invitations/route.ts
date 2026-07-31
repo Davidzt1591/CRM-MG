@@ -131,7 +131,7 @@ function getBaseUrl(request: Request): string {
       "[POST /api/account/invitations] could not derive base URL from request; falling back to marketing domain",
     );
   }
-  return "https://wacrm.tech";
+  return "https://crm.example.com";
 }
 
 const MAX_LABEL_LEN = 80;
