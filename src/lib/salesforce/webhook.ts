@@ -76,6 +76,11 @@ export interface SalesforceCDCConfig {
 
 /**
  * Maps Salesforce Case status values to our internal escalation status.
+ *
+ * The default MUST be 'escalated' — never 'active'. The
+ * salesforce_case_mappings.escalation_status CHECK (042) only allows
+ * ('escalated','waiting','resolved'); writing 'active' violates it and
+ * kills the webhook insert on any DB with 042 applied.
  */
 function mapEscalationStatus(sfStatus: string): string {
   const upper = sfStatus.toUpperCase();
@@ -87,11 +92,17 @@ function mapEscalationStatus(sfStatus: string): string {
   ) {
     return 'waiting';
   }
-  return 'active';
+  return 'escalated';
 }
 
 /**
  * Maps Salesforce Case status values to our internal conversation status.
+ *
+ * The default is 'open' — an unrecognized Salesforce status still means
+ * the case is being worked, and 'open' is legal under the 045 superset
+ * CHECK ('open','active','pending','closed','waiting'). It also matches
+ * the conversations DEFAULT 'open' (001), so an unknown status never
+ * produces a value the constraint rejects.
  */
 function mapConversationStatus(sfStatus: string): string {
   const upper = sfStatus.toUpperCase();
@@ -103,7 +114,7 @@ function mapConversationStatus(sfStatus: string): string {
   ) {
     return 'waiting';
   }
-  return 'active';
+  return 'open';
 }
 
 // ---------------------------------------------------------------------------
@@ -206,7 +217,6 @@ export async function processSalesforceCDC(
   // Record audit event
   await recordAuditEvent({
     accountId: config.accountId,
-    userId: 'system',
     action: 'salesforce.cdc_received',
     targetType: 'salesforce_case_mapping',
     targetId: mapping.id,
@@ -279,7 +289,6 @@ export async function processSalesforceCaseUpdate(
     // Audit
     await recordAuditEvent({
       accountId: config.accountId,
-      userId: 'system',
       action: 'salesforce.case_updated',
       targetType: 'salesforce_case_mapping',
       targetId: mapping.id,

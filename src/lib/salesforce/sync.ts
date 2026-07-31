@@ -111,7 +111,6 @@ export async function escalateToSalesforce(
   // 4. Audit
   await recordAuditEvent({
     accountId,
-    userId: 'system',
     action: 'salesforce.escalated',
     targetType: 'conversation',
     targetId: conversationId,

@@ -155,7 +155,7 @@ export interface ContactNote {
   created_at: string;
 }
 
-export type ConversationStatus = 'open' | 'pending' | 'closed';
+export type ConversationStatus = 'open' | 'active' | 'pending' | 'closed' | 'waiting';
 
 export interface Conversation {
   id: string;
