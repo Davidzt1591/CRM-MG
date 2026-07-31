@@ -1702,6 +1702,12 @@
   "Admin": {
     "pageTitle": "Admin",
     "pageDesc": "Gestiona tu cuenta — departamentos, registros de auditoría y configuración avanzada.",
+    "nav": {
+      "departments": "Departamentos",
+      "whatsapp": "WhatsApp",
+      "salesforce": "Salesforce",
+      "auditLogs": "Registros de auditoría"
+    },
     "departments": {
       "pageTitle": "Departamentos",
       "pageDesc": "Organiza tu equipo en departamentos para enrutar conversaciones.",

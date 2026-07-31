@@ -1703,6 +1703,12 @@
   "Admin": {
     "pageTitle": "관리자",
     "pageDesc": "계정 관리 — 부서, 감사 로그, 고급 설정.",
+    "nav": {
+      "departments": "부서",
+      "whatsapp": "WhatsApp",
+      "salesforce": "Salesforce",
+      "auditLogs": "감사 로그"
+    },
     "departments": {
       "pageTitle": "부서",
       "pageDesc": "팀을 부서로 구성하여 대화를 라우팅하세요.",
