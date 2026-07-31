@@ -2,7 +2,14 @@ import { createAdminClient } from "@/lib/supabase/admin";
 
 export interface RecordAuditEventParams {
   accountId: string;
-  userId: string;
+  /**
+   * User the event is attributed to. OPTIONAL — system-triggered events
+   * (Salesforce CDC webhook, escalation sync) pass 'system' or omit the
+   * field; recordAuditEvent maps both to NULL so the row satisfies the
+   * audit_logs.user_id FK to auth.users (037) after 045 relaxed it to
+   * nullable (MCRM-55 / D11).
+   */
+  userId?: string;
   action: string;
   targetType: string;
   targetId?: string;
@@ -42,9 +49,17 @@ export async function recordAuditEvent(
   try {
     const supabase = createAdminClient();
 
+    // System events (webhook CDC, escalation sync) have no auth.users
+    // FK target. Map the 'system' sentinel — or an omitted userId — to
+    // NULL so the insert satisfies the audit_logs.user_id FK (037,
+    // relaxed to nullable by 045). Never write the raw 'system' sentinel
+    // — it would violate the FK and kill the audit insert.
+    const resolvedUserId =
+      !params.userId || params.userId === "system" ? null : params.userId;
+
     const { error } = await supabase.from("audit_logs").insert({
       account_id: params.accountId,
-      user_id: params.userId,
+      user_id: resolvedUserId,
       action: params.action,
       target_type: params.targetType,
       target_id: params.targetId ?? null,
