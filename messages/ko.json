@@ -1703,6 +1703,7 @@
   "Admin": {
     "pageTitle": "관리자",
     "pageDesc": "계정 관리 — 부서, 감사 로그, 고급 설정.",
+    "salesforce": "Salesforce",
     "nav": {
       "departments": "부서",
       "whatsapp": "WhatsApp",

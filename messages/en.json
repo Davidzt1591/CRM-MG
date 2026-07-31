@@ -1702,6 +1702,7 @@
   "Admin": {
     "pageTitle": "Admin",
     "pageDesc": "Manage your account — departments, audit logs, and advanced configuration.",
+    "salesforce": "Salesforce",
     "nav": {
       "departments": "Departments",
       "whatsapp": "WhatsApp",
