@@ -92,6 +92,41 @@ describe("recordAuditEvent", () => {
     });
   });
 
+  it("maps the 'system' sentinel to user_id NULL (MCRM-55/D11)", async () => {
+    // System-triggered events (Salesforce CDC webhook, escalation sync)
+    // have no auth.users FK target. recordAuditEvent must map the
+    // 'system' sentinel to NULL — with 045 relaxing the NOT NULL, the
+    // insert succeeds; the raw sentinel would violate the FK (037).
+    adminInsert.mockResolvedValue({ error: null });
+
+    await recordAuditEvent({
+      accountId: "acct-1",
+      userId: "system",
+      action: "salesforce.cdc_received",
+      targetType: "salesforce_case_mapping",
+      targetId: "map-1",
+    });
+
+    expect(adminInsert).toHaveBeenCalledWith(
+      expect.objectContaining({ user_id: null }),
+    );
+  });
+
+  it("maps an omitted userId to user_id NULL", async () => {
+    adminInsert.mockResolvedValue({ error: null });
+
+    await recordAuditEvent({
+      accountId: "acct-1",
+      action: "salesforce.escalated",
+      targetType: "conversation",
+      targetId: "conv-1",
+    });
+
+    expect(adminInsert).toHaveBeenCalledWith(
+      expect.objectContaining({ user_id: null }),
+    );
+  });
+
   it("does not throw when the insert fails — it logs and swallows", async () => {
     adminInsert.mockResolvedValue({ error: { message: "permission denied" } });
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});

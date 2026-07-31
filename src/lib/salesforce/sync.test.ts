@@ -240,11 +240,13 @@ describe('Salesforce Sync Triggers', () => {
       expect(convUpdate).toHaveBeenCalledWith({ status: 'waiting' });
       expect(convEq).toHaveBeenCalledWith('id', 'conv-1');
 
-      // Verify audit event recorded
+      // Verify audit event recorded — no user attribution (system
+      // event; recordAuditEvent maps the omission to user_id NULL,
+      // MCRM-55/D11).
       const { recordAuditEvent } = await import('@/lib/audit');
       expect(recordAuditEvent).toHaveBeenCalledWith({
         accountId: 'acct-1',
-        userId: 'system',
+        userId: undefined,
         action: 'salesforce.escalated',
         targetType: 'conversation',
         targetId: 'conv-1',

@@ -144,7 +144,7 @@ describe('processSalesforceCDC', () => {
           id: 'map-1',
           conversation_id: 'conv-1',
           salesforce_case_id: '5005g00001ABCDEFGHI',
-          escalation_status: 'active',
+          escalation_status: 'escalated',
         },
         error: null,
       }),
@@ -210,7 +210,7 @@ describe('processSalesforceCDC', () => {
           id: 'map-2',
           conversation_id: 'conv-2',
           salesforce_case_id: '5005g00002ABCDEFGHI',
-          escalation_status: 'active',
+          escalation_status: 'escalated',
         },
         error: null,
       }),
@@ -245,7 +245,7 @@ describe('processSalesforceCDC', () => {
           id: 'map-3',
           conversation_id: 'conv-3',
           salesforce_case_id: '5005g00003ABCDEFGHI',
-          escalation_status: 'waiting',
+          escalation_status: 'escalated',
         },
         error: null,
       }),
@@ -271,6 +271,15 @@ describe('processSalesforceCDC', () => {
         sender_type: 'system',
       }),
     );
+
+    // Default branch (unrecognized status): escalation 'escalated'
+    // (042-legal — never 'active'), conversation 'open' (045 superset).
+    expect(chain.update).toHaveBeenCalledWith(
+      expect.objectContaining({ escalation_status: 'escalated' }),
+    );
+    expect(chain.update).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'open' }),
+    );
   });
 
   it('records an audit event for CDC processing', async () => {
@@ -280,7 +289,7 @@ describe('processSalesforceCDC', () => {
           id: 'map-4',
           conversation_id: 'conv-4',
           salesforce_case_id: '5005g00004ABCDEFGHI',
-          escalation_status: 'active',
+          escalation_status: 'escalated',
         },
         error: null,
       }),
@@ -290,6 +299,7 @@ describe('processSalesforceCDC', () => {
 
     const { processSalesforceCDC } = await import('./webhook');
     const { recordAuditEvent } = await import('@/lib/audit');
+    const mockedRecordAuditEvent = vi.mocked(recordAuditEvent);
 
     await processSalesforceCDC(mockConfig, {
       ChangeEventHeader: {
@@ -301,11 +311,26 @@ describe('processSalesforceCDC', () => {
       Status: 'In Progress',
     });
 
-    expect(recordAuditEvent).toHaveBeenCalledWith(
+    expect(mockedRecordAuditEvent).toHaveBeenCalledWith(
       expect.objectContaining({
         accountId: 'acct-1',
         action: 'salesforce.cdc_received',
       }),
+    );
+
+    // MCRM-55/D11: the webhook is a system actor — it must NOT pass a
+    // userId ('system' has no auth.users FK target; 045 relaxes the
+    // column so recordAuditEvent can write user_id NULL).
+    expect(mockedRecordAuditEvent.mock.calls[0][0]).not.toHaveProperty('userId');
+
+    // Default branch (unrecognized status, S2/MCRM-54): the mapping
+    // escalates (042-legal 'escalated', never 'active') and the
+    // conversation stays 'open' (045 superset legal).
+    expect(chain.update).toHaveBeenCalledWith(
+      expect.objectContaining({ escalation_status: 'escalated' }),
+    );
+    expect(chain.update).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'open' }),
     );
   });
 });
@@ -335,7 +360,7 @@ describe('processSalesforceCaseUpdate', () => {
         data: {
           id: 'map-1',
           conversation_id: 'conv-1',
-          escalation_status: 'active',
+          escalation_status: 'escalated',
         },
         error: null,
       }),
