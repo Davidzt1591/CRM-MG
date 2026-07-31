@@ -12,6 +12,11 @@ export async function middleware(request: NextRequest) {
   // so every response gets a fresh nonce. unsafe-eval stays because Next.js
   // Turbopack and some production optimisations need it. unsafe-inline for
   // script-src is REMOVED — inline scripts must use the nonce.
+  //
+  // SEC-09: violation reporting. `report-uri` is the legacy directive every
+  // browser still honours; `report-to` is the modern replacement and pairs
+  // with the Report-To response header below. Both point at the local
+  // /api/csp-report endpoint.
   const csp = [
     "default-src 'self'",
     `script-src 'self' 'unsafe-eval' 'nonce-${nonce}'`,
@@ -23,7 +28,17 @@ export async function middleware(request: NextRequest) {
     "frame-ancestors 'none'",
     "base-uri 'self'",
     "form-action 'self'",
+    "report-uri /api/csp-report",
+    "report-to csp-endpoint",
   ].join('; ');
+
+  // Report-To group consumed by the CSP `report-to csp-endpoint` directive.
+  const reportToHeader = JSON.stringify({
+    group: 'csp-endpoint',
+    max_age: 10886400,
+    endpoints: [{ url: '/api/csp-report' }],
+    include_subdomains: false,
+  });
 
   // Pass the nonce to the page via request header so layout.tsx can
   // read it with `headers()` from next/headers and pass it to <Script>.
@@ -32,6 +47,7 @@ export async function middleware(request: NextRequest) {
 
   let supabaseResponse = NextResponse.next({ request: { headers: requestHeaders } });
   supabaseResponse.headers.set('Content-Security-Policy', csp);
+  supabaseResponse.headers.set('Report-To', reportToHeader);
   supabaseResponse.headers.set('x-nonce', nonce);
 
   const supabase = createServerClient(
@@ -46,6 +62,7 @@ export async function middleware(request: NextRequest) {
           cookiesToSet.forEach(({ name, value, options }) => request.cookies.set(name, value))
           supabaseResponse = NextResponse.next({ request: { headers: requestHeaders } })
           supabaseResponse.headers.set('Content-Security-Policy', csp)
+          supabaseResponse.headers.set('Report-To', reportToHeader)
           supabaseResponse.headers.set('x-nonce', nonce)
           cookiesToSet.forEach(({ name, value, options }) =>
             supabaseResponse.cookies.set(name, value, options)
@@ -72,6 +89,7 @@ export async function middleware(request: NextRequest) {
       response.cookies.set(cookie)
     })
     response.headers.set('Content-Security-Policy', csp)
+    response.headers.set('Report-To', reportToHeader)
     response.headers.set('x-nonce', nonce)
     return response
   }

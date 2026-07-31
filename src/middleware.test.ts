@@ -106,6 +106,39 @@ describe("middleware — CSP nonce", () => {
   });
 });
 
+describe("middleware — CSP violation reporting (SEC-09)", () => {
+  it("includes report-uri pointing at the local report endpoint", async () => {
+    mockUser = { id: "user-1" };
+    const res = await middleware(new NextRequest("https://app.test/dashboard"));
+    const csp = cspValue(res)!;
+    expect(csp).toContain("report-uri /api/csp-report");
+  });
+
+  it("includes report-to group for modern browsers", async () => {
+    mockUser = { id: "user-1" };
+    const res = await middleware(new NextRequest("https://app.test/dashboard"));
+    const csp = cspValue(res)!;
+    expect(csp).toContain("report-to csp-endpoint");
+  });
+
+  it("sends a Report-To header defining the csp-endpoint group", async () => {
+    mockUser = { id: "user-1" };
+    const res = await middleware(new NextRequest("https://app.test/dashboard"));
+    const reportTo = res.headers.get("Report-To");
+    expect(reportTo).toBeTruthy();
+    expect(reportTo).toContain("csp-endpoint");
+    expect(reportTo).toContain("/api/csp-report");
+  });
+
+  it("keeps reporting on responses that carry refreshed auth cookies", async () => {
+    mockUser = { id: "user-1" };
+    refreshedCookies = [ROTATED];
+    const res = await middleware(new NextRequest("https://app.test/login"));
+    // Redirect responses must still advertise the reporting group.
+    expect(res.headers.get("Report-To")).toContain("csp-endpoint");
+  });
+});
+
 const ROTATED = {
   name: "sb-test-auth-token",
   value: "rotated-refresh-token",
