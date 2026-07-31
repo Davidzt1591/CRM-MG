@@ -24,9 +24,18 @@ import crypto from 'crypto'
  *   Existing rows can be upgraded in place by call sites that hold a
  *   Supabase client — see the `isLegacyFormat` / `encrypt` pattern in
  *   `src/app/api/whatsapp/send/route.ts`.
+ *
+ * Key rotation:
+ *   Set `ENCRYPTION_KEY_PREVIOUS` to the old key (32-byte hex) before
+ *   deploying the new `ENCRYPTION_KEY`. `decrypt()` tries the current
+ *   key first, then the previous key as fallback. Call `reEncrypt()`
+ *   on any value that was decrypted with the previous key to rewrite it
+ *   with the current key — this lets you rotate keys without a data
+ *   migration window.
  */
 
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY!
+const ENCRYPTION_KEY_PREVIOUS = process.env.ENCRYPTION_KEY_PREVIOUS
 // 12 bytes is the NIST-recommended IV length for GCM — keeps the
 // counter block well below 2^32 and matches the default web-crypto
 // behaviour, so any future port is straightforward.
@@ -34,6 +43,9 @@ const GCM_IV_LENGTH = 12
 const CBC_IV_LENGTH = 16
 const AUTH_TAG_LENGTH = 16
 
+/**
+ * Encrypt plaintext with AES-256-GCM using the current ENCRYPTION_KEY.
+ */
 export function encrypt(text: string): string {
   const iv = crypto.randomBytes(GCM_IV_LENGTH)
   const cipher = crypto.createCipheriv(
@@ -47,7 +59,12 @@ export function encrypt(text: string): string {
   return `${iv.toString('hex')}:${encrypted}:${authTag.toString('hex')}`
 }
 
-export function decrypt(encryptedText: string): string {
+// ---------------------------------------------------------------------------
+// Internal: decrypt with an explicit key. Shared by the public decrypt()
+// (which tries current + fallback) and reEncrypt().
+// ---------------------------------------------------------------------------
+
+function decryptWithKey(encryptedText: string, keyHex: string): string {
   const parts = encryptedText.split(':')
 
   if (parts.length === 3) {
@@ -67,7 +84,7 @@ export function decrypt(encryptedText: string): string {
     }
     const decipher = crypto.createDecipheriv(
       'aes-256-gcm',
-      Buffer.from(ENCRYPTION_KEY, 'hex'),
+      Buffer.from(keyHex, 'hex'),
       iv,
     )
     decipher.setAuthTag(authTag)
@@ -87,7 +104,7 @@ export function decrypt(encryptedText: string): string {
     }
     const decipher = crypto.createDecipheriv(
       'aes-256-cbc',
-      Buffer.from(ENCRYPTION_KEY, 'hex'),
+      Buffer.from(keyHex, 'hex'),
       iv,
     )
     let decrypted = decipher.update(ctHex, 'hex', 'utf8')
@@ -100,6 +117,47 @@ export function decrypt(encryptedText: string): string {
       parts.length - 1
     })`,
   )
+}
+
+/**
+ * Decrypt a ciphertext using the current key.
+ * Falls back to ENCRYPTION_KEY_PREVIOUS when the current key fails
+ * (e.g. the ciphertext was created before a key rotation).
+ */
+export function decrypt(encryptedText: string): string {
+  try {
+    return decryptWithKey(encryptedText, ENCRYPTION_KEY)
+  } catch (e) {
+    // If a previous key is configured, try it as fallback.
+    if (ENCRYPTION_KEY_PREVIOUS) {
+      return decryptWithKey(encryptedText, ENCRYPTION_KEY_PREVIOUS)
+    }
+    // No fallback — rethrow the original error (auth tag mismatch,
+    // unrecognised format, etc.).
+    throw e
+  }
+}
+
+/**
+ * Re-encrypt a ciphertext with the current key.
+ *
+ * Tries the current key first, then ENCRYPTION_KEY_PREVIOUS as fallback
+ * (same as `decrypt()`). Re-encrypts with the current key.
+ *
+ * Use this during a key rotation to upgrade stored ciphertexts without
+ * a data migration: read each row, call `reEncrypt()`, write the result
+ * back. Entries already using the current key are re-encrypted in-place
+ * (produces a fresh IV, same plaintext).
+ */
+export function reEncrypt(encryptedText: string): string {
+  try {
+    return encrypt(decryptWithKey(encryptedText, ENCRYPTION_KEY))
+  } catch (e) {
+    if (ENCRYPTION_KEY_PREVIOUS) {
+      return encrypt(decryptWithKey(encryptedText, ENCRYPTION_KEY_PREVIOUS))
+    }
+    throw e
+  }
 }
 
 /**
