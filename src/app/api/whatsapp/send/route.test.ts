@@ -152,7 +152,9 @@ vi.mock('@/lib/whatsapp/encryption', () => ({
 }))
 
 const { sendTemplateMessage } = vi.hoisted(() => ({
-  sendTemplateMessage: vi.fn(async () => ({ messageId: 'wamid-1' })),
+  sendTemplateMessage: vi.fn(
+    async (..._args: unknown[]) => ({ messageId: 'wamid-1' }),
+  ),
 }))
 
 // The send route no longer imports meta-api directly — it routes through

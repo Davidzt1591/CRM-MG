@@ -13,6 +13,7 @@
  */
 
 import { createClient } from '@supabase/supabase-js';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import { SalesforceClient } from './client';
 import { recordAuditEvent } from '@/lib/audit';
 
@@ -20,7 +21,7 @@ import { recordAuditEvent } from '@/lib/audit';
 // Lazy admin client
 // ---------------------------------------------------------------------------
 
-let _adminClient: ReturnType<typeof createClient> | null = null;
+let _adminClient: SupabaseClient | undefined;
 
 function supabaseAdmin() {
   if (!_adminClient) {

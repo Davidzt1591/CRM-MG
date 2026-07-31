@@ -10,16 +10,13 @@ const mockEq = vi.fn(() => ({
   single: mockSingle,
 }));
 const mockFrom = vi.fn(() => ({
-  select: mockFrom,
-  ...{
-    select: (...args: unknown[]) => ({
-      ...mockSelect(...args),
-      eq: mockEq,
-      single: mockSingle,
-    }),
+  select: () => ({
+    ...mockSelect(),
     eq: mockEq,
     single: mockSingle,
-  },
+  }),
+  eq: mockEq,
+  single: mockSingle,
 }));
 
 const mockSupabaseClient = {

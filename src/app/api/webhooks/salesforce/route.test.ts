@@ -14,7 +14,7 @@ function buildChain() {
 }
 buildChain();
 
-let mockSingleResult = () =>
+let mockSingleResult: () => Promise<{ data: unknown; error: unknown }> = () =>
   Promise.resolve({ data: null, error: null });
 mockSupabaseChain.single = vi.fn(() => mockSingleResult());
 

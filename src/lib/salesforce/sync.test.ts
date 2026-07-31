@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { SalesforceCase, SalesforceFeedItem } from './client';
+import type { Mock } from 'vitest';
+import type { SalesforceCase, SalesforceFeedItem, SalesforceClient } from './client';
 
 // ---------------------------------------------------------------------------
 // Mocks
@@ -85,9 +86,9 @@ const MOCK_FEED_ITEM: SalesforceFeedItem = {
 // ---------------------------------------------------------------------------
 
 describe('Salesforce Sync Triggers', () => {
-  let createCaseMock: ReturnType<typeof vi.fn>;
-  let updateCaseMock: ReturnType<typeof vi.fn>;
-  let postFeedItemMock: ReturnType<typeof vi.fn>;
+  let createCaseMock: Mock<SalesforceClient['createCase']>;
+  let updateCaseMock: Mock<SalesforceClient['updateCase']>;
+  let postFeedItemMock: Mock<SalesforceClient['postFeedItem']>;
 
   beforeEach(async () => {
     vi.clearAllMocks();
@@ -112,9 +113,15 @@ describe('Salesforce Sync Triggers', () => {
     Object.assign(mockSupabase, mockSupabaseChain(() => mockSingle()));
 
     // Setup mock methods on SalesforceClient prototype
-    createCaseMock = vi.fn().mockResolvedValue(MOCK_CASE);
-    updateCaseMock = vi.fn().mockResolvedValue(undefined);
-    postFeedItemMock = vi.fn().mockResolvedValue(MOCK_FEED_ITEM);
+    createCaseMock = vi
+      .fn<SalesforceClient['createCase']>()
+      .mockResolvedValue(MOCK_CASE);
+    updateCaseMock = vi
+      .fn<SalesforceClient['updateCase']>()
+      .mockResolvedValue(undefined);
+    postFeedItemMock = vi
+      .fn<SalesforceClient['postFeedItem']>()
+      .mockResolvedValue(MOCK_FEED_ITEM);
 
     const { SalesforceClient } = await import('@/lib/salesforce/client');
     SalesforceClient.prototype.createCase = createCaseMock;

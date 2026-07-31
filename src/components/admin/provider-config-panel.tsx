@@ -150,7 +150,10 @@ export function ProviderConfigPanel() {
             <Label>WhatsApp Provider</Label>
             <Select
               value={form.provider}
-              onValueChange={(v: 'meta' | 'openwa') => set('provider', v)}
+              onValueChange={(v) => {
+                if (!v) return;
+                set('provider', v);
+              }}
             >
               <SelectTrigger className="w-64 bg-muted border-border text-foreground">
                 <SelectValue placeholder="Select provider" />

@@ -8,6 +8,7 @@
 
 import { NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import { encrypt, decrypt } from '@/lib/whatsapp/encryption';
 import { recordAuditEvent } from '@/lib/audit';
 import { SalesforceClient } from '@/lib/salesforce/client';
@@ -16,7 +17,7 @@ import { SalesforceClient } from '@/lib/salesforce/client';
 // Lazy admin client
 // ---------------------------------------------------------------------------
 
-let _adminClient: ReturnType<typeof createClient> | null = null;
+let _adminClient: SupabaseClient | undefined;
 
 function supabaseAdmin() {
   if (!_adminClient) {

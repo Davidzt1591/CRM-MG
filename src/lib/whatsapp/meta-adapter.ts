@@ -77,9 +77,7 @@ export class MetaAdapter implements WhatsAppProvider {
       to: args.to,
       templateName: args.templateName,
       language: args.templateLanguage ?? 'en_US',
-      params: args.templateParams
-        ? Object.values(args.templateParams)
-        : args.templateMessageParams ?? [],
+      params: args.templateParams ?? [],
       messageParams: args.templateMessageParams ?? undefined,
       accessToken: args.accessToken ?? this.accessToken,
       phoneNumberId: args.phoneNumberId ?? this.phoneNumberId,

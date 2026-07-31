@@ -15,6 +15,8 @@
 // Send method argument types
 // ---------------------------------------------------------------------------
 
+import type { SendTimeParams } from './template-send-builder';
+
 export interface SendTextArgs {
   to: string
   text: string
@@ -37,8 +39,10 @@ export interface SendTemplateArgs {
   to: string
   templateName: string
   templateLanguage?: string
-  templateParams?: Record<string, string>
-  templateMessageParams?: string[]
+  /** Legacy positional body params (values for {{1}}, {{2}}, …). */
+  templateParams?: string[]
+  /** Structured per-send params (header/body/buttons) — see SendTimeParams. */
+  templateMessageParams?: SendTimeParams
   accessToken?: string
   phoneNumberId?: string
 }

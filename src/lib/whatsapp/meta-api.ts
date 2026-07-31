@@ -220,6 +220,12 @@ export interface SendTextMessageArgs {
   accessToken: string
   to: string
   text: string
+  /**
+   * Whether to request a link preview for the message. Accepted for
+   * interface parity with `SendTextArgs` — the current payload does
+   * not forward it to Meta (preview_url is not set on the text body).
+   */
+  previewUrl?: boolean
   /** Meta's message_id of the message being replied to. Adds a `context` field
    *  so WhatsApp renders the new message as a reply with a quote preview. */
   contextMessageId?: string

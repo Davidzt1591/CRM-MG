@@ -338,7 +338,7 @@ export async function sendMessageToConversation(
         to: phone,
         templateName: templateName!,
         templateLanguage: templateLanguage || 'en_US',
-        templateParams: templateParams ?? (templateRow ? {} : undefined),
+        templateParams: templateParams ?? (templateRow ? [] : undefined),
         templateMessageParams: templateMessageParams ?? undefined,
       });
       return result.messageId;
