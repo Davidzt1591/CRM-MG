@@ -21,14 +21,14 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 
-import {
-  sendTextMessage,
-  sendTemplateMessage,
-  sendMediaMessage,
-  sendInteractiveButtons,
-  sendInteractiveList,
-  type MediaKind,
-} from '@/lib/whatsapp/meta-api';
+import { getProvider } from '@/lib/whatsapp/provider-registry';
+import type {
+  SendTextArgs,
+  SendMediaArgs,
+  SendTemplateArgs,
+  SendInteractiveButtonsArgs,
+  SendInteractiveListArgs,
+} from '@/lib/whatsapp/provider';
 import {
   validateInteractivePayload,
   interactivePayloadPreviewText,
@@ -280,6 +280,9 @@ export async function sendMessageToConversation(
       });
   }
 
+  // Resolve the active provider adapter for this account.
+  const provider = await getProvider(accountId);
+
   // Resolve the reply target to its Meta message_id. The parent must
   // belong to this same conversation — otherwise a caller could quote
   // messages they can't see by guessing UUIDs.
@@ -331,66 +334,50 @@ export async function sendMessageToConversation(
 
   const attempt = async (phone: string): Promise<string> => {
     if (messageType === 'template') {
-      const result = await sendTemplateMessage({
-        phoneNumberId: config.phone_number_id,
-        accessToken,
+      const result = await provider.sendTemplate({
         to: phone,
         templateName: templateName!,
-        language: templateLanguage || 'en_US',
-        template: templateRow ?? undefined,
-        messageParams: templateMessageParams ?? undefined,
-        params: templateParams || [],
-        contextMessageId,
+        templateLanguage: templateLanguage || 'en_US',
+        templateParams: templateParams ?? (templateRow ? {} : undefined),
+        templateMessageParams: templateMessageParams ?? undefined,
       });
       return result.messageId;
     }
     if (isMediaKind) {
-      const result = await sendMediaMessage({
-        phoneNumberId: config.phone_number_id,
-        accessToken,
+      const result = await provider.sendMedia({
         to: phone,
-        kind: messageType as MediaKind,
-        link: mediaUrl!,
+        mediaType: messageType as SendMediaArgs['mediaType'],
+        mediaUrl: mediaUrl!,
         caption: contentText || undefined,
         filename: filename || undefined,
-        contextMessageId,
       });
       return result.messageId;
     }
     if (messageType === 'interactive') {
       const p = interactivePayload!;
       if (p.kind === 'buttons') {
-        const result = await sendInteractiveButtons({
-          phoneNumberId: config.phone_number_id,
-          accessToken,
+        const result = await provider.sendInteractiveButtons({
           to: phone,
           bodyText: p.body,
           headerText: p.header || undefined,
           footerText: p.footer || undefined,
           buttons: p.buttons,
-          contextMessageId,
         });
         return result.messageId;
       }
-      const result = await sendInteractiveList({
-        phoneNumberId: config.phone_number_id,
-        accessToken,
+      const result = await provider.sendInteractiveList({
         to: phone,
         bodyText: p.body,
-        buttonLabel: p.button_label,
+        buttonText: p.button_label,
         headerText: p.header || undefined,
         footerText: p.footer || undefined,
         sections: p.sections,
-        contextMessageId,
       });
       return result.messageId;
     }
-    const result = await sendTextMessage({
-      phoneNumberId: config.phone_number_id,
-      accessToken,
+    const result = await provider.sendText({
       to: phone,
       text: contentText!,
-      contextMessageId,
     });
     return result.messageId;
   };

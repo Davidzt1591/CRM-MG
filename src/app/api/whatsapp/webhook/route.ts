@@ -13,6 +13,8 @@ import {
   handleTemplateWebhookChange,
   isTemplateWebhookField,
 } from '@/lib/whatsapp/template-webhook'
+import { getProvider } from '@/lib/whatsapp/provider-registry'
+import type { WhatsAppProvider, WebhookEvent } from '@/lib/whatsapp/provider'
 
 // The `after()` callback in POST runs within this route's max duration.
 // Inbound processing can fan out to per-media Meta verification calls, so
@@ -168,54 +170,118 @@ export async function GET(request: Request) {
   }
 }
 
-// POST - Receive messages
-export async function POST(request: Request) {
-  // Read raw body first so we can HMAC-verify the exact bytes Meta
-  // signed. request.json() would re-encode and break the signature.
-  const rawBody = await request.text()
-  const signature = request.headers.get('x-hub-signature-256')
-
-  if (!verifyMetaWebhookSignature(rawBody, signature)) {
-    // 401 (not 200) — we want Meta's delivery dashboard to show failures
-    // loudly if a misconfiguration causes signatures to stop matching,
-    // rather than silently eating events.
-    console.warn('[webhook] rejected request with invalid signature')
-    return NextResponse.json({ error: 'Invalid signature' }, { status: 401 })
-  }
-
-  let body: { entry?: WhatsAppWebhookEntry[] }
-  try {
-    body = JSON.parse(rawBody)
-  } catch {
-    return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
-  }
-
-  // Process AFTER the response so we ack Meta within their ~20s timeout
-  // (a slow ack triggers Meta retries + duplicate inserts), while still
-  // guaranteeing the work runs to completion.
-  //
-  // This MUST use `after()` rather than a detached `processWebhook(body)`
-  // promise: on serverless platforms (we run on Vercel) the function can
-  // be frozen or terminated the moment the response is sent, so a floating
-  // promise's DB writes are not guaranteed to finish. That dropped a
-  // non-deterministic *subset* of inbound messages — contacts/conversations
-  // were created but the message insert never landed, leaving conversations
-  // that show in the inbox with an empty thread, and no logs to explain it
-  // (see issue #301). `after()` hands the callback to the runtime, which
-  // keeps the function alive until it resolves (within the route's
-  // maxDuration).
-  after(async () => {
-    try {
-      await processWebhook(body)
-    } catch (error) {
-      console.error('Error processing webhook:', error)
-    }
-  })
-
-  return NextResponse.json({ status: 'received' }, { status: 200 })
+/**
+ * Determine which provider sent this webhook based on the request headers.
+ *
+ * Meta sends `x-hub-signature-256` with `sha256=…` values.
+ * OpenWA sends `x-webhook-signature` with a raw hex HMAC.
+ * Returns `'meta'`, `'openwa'`, or `null` when neither matches.
+ */
+function detectProvider(
+  metaSignature: string | null,
+  openwaSignature: string | null,
+): 'meta' | 'openwa' | null {
+  if (metaSignature?.startsWith('sha256=')) return 'meta'
+  if (openwaSignature) return 'openwa'
+  return null
 }
 
-async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
+// POST - Receive messages
+export async function POST(request: Request) {
+  // Read raw body first so we can HMAC-verify the exact bytes the
+  // provider signed. request.json() would re-encode and break the
+  // signature.
+  const rawBody = await request.text()
+  const metaSignature = request.headers.get('x-hub-signature-256')
+  const openwaSignature = request.headers.get('x-webhook-signature')
+
+  const provider = detectProvider(metaSignature, openwaSignature)
+
+  // ── Meta Cloud API path ──────────────────────────────────────────
+  if (provider === 'meta') {
+    if (!verifyMetaWebhookSignature(rawBody, metaSignature)) {
+      // 401 (not 200) — we want Meta's delivery dashboard to show
+      // failures loudly if a misconfiguration causes signatures to
+      // stop matching, rather than silently eating events.
+      console.warn('[webhook] rejected Meta request with invalid signature')
+      return NextResponse.json({ error: 'Invalid signature' }, { status: 401 })
+    }
+
+    let body: { entry?: WhatsAppWebhookEntry[] }
+    try {
+      body = JSON.parse(rawBody)
+    } catch {
+      return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
+    }
+
+    // Process AFTER the response so we ack Meta within their ~20s timeout
+    // (a slow ack triggers Meta retries + duplicate inserts), while still
+    // guaranteeing the work runs to completion.
+    //
+    // This MUST use `after()` rather than a detached promise: on
+    // serverless platforms (we run on Vercel) the function can be frozen
+    // or terminated the moment the response is sent, so a floating
+    // promise's DB writes are not guaranteed to finish (see issue #301).
+    after(async () => {
+      try {
+        await processMetaWebhook(body)
+      } catch (error) {
+        console.error('[webhook] Error processing Meta webhook:', error)
+      }
+    })
+
+    return NextResponse.json({ status: 'received' }, { status: 200 })
+  }
+
+  // ── OpenWA path ──────────────────────────────────────────────────
+  if (provider === 'openwa') {
+    const accountId = new URL(request.url).searchParams.get('account_id')
+    if (!accountId) {
+      console.warn('[webhook] OpenWA request missing account_id query param')
+      return NextResponse.json({ error: 'Missing account_id' }, { status: 400 })
+    }
+
+    // Resolve the provider adapter for this account. getProvider may
+    // throw if the account has no valid whatsapp_config row or uses an
+    // unknown provider type.
+    let adapter: WhatsAppProvider
+    try {
+      adapter = await getProvider(accountId)
+    } catch (err) {
+      console.error('[webhook] failed to get provider for account', accountId, err)
+      return NextResponse.json({ error: 'Provider not configured' }, { status: 500 })
+    }
+
+    if (!adapter.verifyRequest(openwaSignature ?? '', rawBody)) {
+      console.warn('[webhook] rejected OpenWA request with invalid signature')
+      return NextResponse.json({ error: 'Invalid signature' }, { status: 401 })
+    }
+
+    let body: unknown
+    try {
+      body = JSON.parse(rawBody)
+    } catch {
+      return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
+    }
+
+    after(async () => {
+      try {
+        await processOpenWAWebhook(body, accountId, adapter)
+      } catch (error) {
+        console.error('[webhook] Error processing OpenWA webhook:', error)
+      }
+    })
+
+    return NextResponse.json({ status: 'received' }, { status: 200 })
+  }
+
+  // ── No recognizable signature ────────────────────────────────────
+  console.warn('[webhook] rejected request with no recognizable signature')
+  return NextResponse.json({ error: 'Invalid signature' }, { status: 401 })
+}
+
+/** Process a Meta Cloud API webhook payload (messages, statuses, templates). */
+async function processMetaWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
   if (!body.entry) return
 
   for (const entry of body.entry) {
@@ -303,6 +369,92 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
           decryptedAccessToken
         )
       }
+    }
+  }
+}
+
+/**
+ * Process an OpenWA webhook payload by parsing it through the provider
+ * adapter and dispatching each normalized event to the shared business
+ * logic functions (processMessage, handleStatusUpdate).
+ *
+ * OpenWA webhooks use a different payload shape than Meta, but after
+ * normalisation via provider.processWebhook() the resulting events have
+ * a common shape that the existing handlers can consume.
+ */
+async function processOpenWAWebhook(
+  body: unknown,
+  accountId: string,
+  adapter: WhatsAppProvider,
+) {
+  const events: WebhookEvent[] = await adapter.processWebhook(body)
+  if (events.length === 0) return
+
+  // Look up the whatsapp_config for this account to get config owner
+  // (used as sender-of-record on inserts) and the decrypted access
+  // token (needed for media downloads inside parseMessageContent).
+  const { data: config, error: configErr } = await supabaseAdmin()
+    .from('whatsapp_config')
+    .select('*')
+    .eq('account_id', accountId)
+    .single()
+
+  if (configErr || !config) {
+    console.error(
+      '[webhook] no whatsapp_config for account',
+      accountId,
+      configErr?.message ?? '',
+    )
+    return
+  }
+
+  const accessToken = decrypt(config.access_token)
+  const configOwnerUserId = config.user_id
+
+  for (const event of events) {
+    const p = event.payload
+
+    switch (event.type) {
+      case 'message': {
+        // OpenWA sends phone numbers (possibly with @s.whatsapp.net
+        // JID suffix). Strip the suffix so the existing contact lookup
+        // (which uses normalizePhone → strip non-digits) works.
+        const from = String(p.from ?? '').replace(/@.*$/, '')
+        if (!from) {
+          console.warn('[webhook] OpenWA message event missing "from" — skipping')
+          continue
+        }
+
+        const message = {
+          id: String(p.messageId ?? ''),
+          from,
+          timestamp: String(p.timestamp ?? Math.floor(Date.now() / 1000)),
+          type: 'text',
+          text: { body: String(p.text ?? '') },
+        } satisfies WhatsAppMessage
+
+        const contactInfo = {
+          profile: { name: from },
+          wa_id: from,
+        }
+
+        await processMessage(message, contactInfo, accountId, configOwnerUserId, accessToken)
+        break
+      }
+
+      case 'status': {
+        await handleStatusUpdate({
+          id: String(p.messageId ?? ''),
+          status: String(p.status ?? ''),
+          timestamp: String(p.timestamp ?? Math.floor(Date.now() / 1000)),
+          recipient_id: String(p.recipientId ?? ''),
+        })
+        break
+      }
+
+      default:
+        // Unknown event types are silently ignored.
+        break
     }
   }
 }
