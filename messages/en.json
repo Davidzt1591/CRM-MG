@@ -1749,6 +1749,21 @@
       "transferLog": "Transfer History",
       "transferLogEmpty": "No transfers recorded yet."
     },
-    "auditLogs": "Audit Logs"
+    "auditLogs": {
+      "pageTitle": "Audit Logs",
+      "pageDesc": "A read-only trail of security-relevant actions in your account.",
+      "empty": "No audit events recorded yet.",
+      "fetchError": "Failed to load audit logs",
+      "columns": {
+        "date": "Date",
+        "action": "Action",
+        "user": "User",
+        "targetType": "Target",
+        "targetId": "Target ID",
+        "changes": "Changes"
+      },
+      "noChanges": "—",
+      "unknownUser": "Unknown user"
+    }
   }
 }

@@ -1749,6 +1749,21 @@
       "transferLog": "Historial de transferencias",
       "transferLogEmpty": "Aún no hay transferencias registradas."
     },
-    "auditLogs": "Registros de auditoría"
+    "auditLogs": {
+      "pageTitle": "Registros de auditoría",
+      "pageDesc": "Un rastro de solo lectura de las acciones relevantes para la seguridad en tu cuenta.",
+      "empty": "Aún no hay eventos de auditoría registrados.",
+      "fetchError": "No se pudieron cargar los registros de auditoría",
+      "columns": {
+        "date": "Fecha",
+        "action": "Acción",
+        "user": "Usuario",
+        "targetType": "Destino",
+        "targetId": "ID de destino",
+        "changes": "Cambios"
+      },
+      "noChanges": "—",
+      "unknownUser": "Usuario desconocido"
+    }
   }
 }
