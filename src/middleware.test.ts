@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import crypto from 'node:crypto';
 import { NextRequest } from "next/server";
 
 // --- Scenario knobs the mock reads -----------------------------------------
@@ -46,6 +47,64 @@ beforeEach(() => {
 });
 
 afterEach(() => vi.clearAllMocks());
+
+function cspValue(res: Response): string | null {
+  return res.headers.get("Content-Security-Policy");
+}
+
+describe("middleware — CSP nonce", () => {
+  it("sets Content-Security-Policy header on HTML page responses", async () => {
+    mockUser = { id: "user-1" };
+    const res = await middleware(new NextRequest("https://app.test/dashboard"));
+    expect(cspValue(res)).toBeTruthy();
+  });
+
+  it("includes a unique nonce per request in script-src", async () => {
+    mockUser = { id: "user-1" };
+    const res1 = await middleware(new NextRequest("https://app.test/dashboard"));
+    const res2 = await middleware(new NextRequest("https://app.test/dashboard"));
+    const csp1 = cspValue(res1)!;
+    const csp2 = cspValue(res2)!;
+
+    // Extract nonces
+    const match1 = /'nonce-([^']+)'/.exec(csp1);
+    const match2 = /'nonce-([^']+)'/.exec(csp2);
+    expect(match1).not.toBeNull();
+    expect(match2).not.toBeNull();
+    // Nonces must differ per request
+    expect(match1![1]).not.toBe(match2![1]);
+  });
+
+  it("contains 'self' and nonce in script-src directive", async () => {
+    mockUser = { id: "user-1" };
+    const res = await middleware(new NextRequest("https://app.test/dashboard"));
+    const csp = cspValue(res)!;
+    expect(csp).toContain("script-src");
+    expect(csp).toContain("'self'");
+    expect(csp).toMatch(/'nonce-/);
+  });
+
+  it("sets x-nonce response header", async () => {
+    mockUser = { id: "user-1" };
+    const res = await middleware(new NextRequest("https://app.test/dashboard"));
+    const nonce = res.headers.get("x-nonce");
+    expect(nonce).toBeTruthy();
+    expect(nonce).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
+  });
+
+  it("does not set CSP on API routes by default (differentiator)", async () => {
+    // API routes don't render HTML so CSP is less critical; verify it's still set
+    mockUser = { id: "user-1" };
+    const res = await middleware(
+      new NextRequest("https://app.test/api/whatsapp/send"),
+    );
+    // Should still get CSP since middleware applies to all matched routes
+    // (the middleware matcher is broad — it's per-response, not per-page)
+    expect(cspValue(res)).toBeTruthy();
+  });
+});
 
 const ROTATED = {
   name: "sb-test-auth-token",

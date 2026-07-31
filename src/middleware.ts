@@ -1,8 +1,38 @@
+import crypto from 'node:crypto';
 import { createServerClient } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
 
 export async function middleware(request: NextRequest) {
-  let supabaseResponse = NextResponse.next({ request })
+  // Generate a per-request nonce for CSP enforcement.
+  // Must be unique per request so attackers can't bypass via nonce-injection.
+  const nonce = crypto.randomUUID();
+
+  // Build the Content-Security-Policy with the nonce woven in.
+  // Previously this was Report-Only in next.config.ts; now enforced here
+  // so every response gets a fresh nonce. unsafe-eval stays because Next.js
+  // Turbopack and some production optimisations need it. unsafe-inline for
+  // script-src is REMOVED — inline scripts must use the nonce.
+  const csp = [
+    "default-src 'self'",
+    `script-src 'self' 'unsafe-eval' 'nonce-${nonce}'`,
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob: https:",
+    "media-src 'self' blob: https://*.supabase.co",
+    "font-src 'self' data:",
+    "connect-src 'self' https://*.supabase.co wss://*.supabase.co",
+    "frame-ancestors 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+  ].join('; ');
+
+  // Pass the nonce to the page via request header so layout.tsx can
+  // read it with `headers()` from next/headers and pass it to <Script>.
+  const requestHeaders = new Headers(request.headers);
+  requestHeaders.set('x-nonce', nonce);
+
+  let supabaseResponse = NextResponse.next({ request: { headers: requestHeaders } });
+  supabaseResponse.headers.set('Content-Security-Policy', csp);
+  supabaseResponse.headers.set('x-nonce', nonce);
 
   const supabase = createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -14,7 +44,9 @@ export async function middleware(request: NextRequest) {
         },
         setAll(cookiesToSet) {
           cookiesToSet.forEach(({ name, value, options }) => request.cookies.set(name, value))
-          supabaseResponse = NextResponse.next({ request })
+          supabaseResponse = NextResponse.next({ request: { headers: requestHeaders } })
+          supabaseResponse.headers.set('Content-Security-Policy', csp)
+          supabaseResponse.headers.set('x-nonce', nonce)
           cookiesToSet.forEach(({ name, value, options }) =>
             supabaseResponse.cookies.set(name, value, options)
           )
@@ -39,6 +71,8 @@ export async function middleware(request: NextRequest) {
     supabaseResponse.cookies.getAll().forEach((cookie) => {
       response.cookies.set(cookie)
     })
+    response.headers.set('Content-Security-Policy', csp)
+    response.headers.set('x-nonce', nonce)
     return response
   }
 

@@ -35,32 +35,10 @@ const SECURITY_HEADERS = [
     key: "Permissions-Policy",
     value: "camera=(), microphone=(self), geolocation=(), payment=(), usb=()",
   },
-  {
-    key: "Content-Security-Policy-Report-Only",
-    value: [
-      "default-src 'self'",
-      // Next.js needs 'unsafe-inline' for its inline hydration script
-      // and 'unsafe-eval' in dev + some production optimisations.
-      // Nonce-based CSP is a later project.
-      "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
-      // Tailwind + inline style attributes on lots of components.
-      "style-src 'self' 'unsafe-inline'",
-      // Supabase public-bucket avatars, contact avatars (arbitrary
-      // https URLs paste-able from the UI), OG images, data URLs for
-      // tiny inline assets.
-      "img-src 'self' data: blob: https:",
-      // Outbound media previews (blob: from MediaRecorder + file picker)
-      // and Supabase public-bucket audio/video the inbox renders.
-      "media-src 'self' blob: https://*.supabase.co",
-      "font-src 'self' data:",
-      // Supabase REST + realtime (WSS). All Meta API calls happen
-      // server-side, so graph.facebook.com does not belong here.
-      "connect-src 'self' https://*.supabase.co wss://*.supabase.co",
-      "frame-ancestors 'none'",
-      "base-uri 'self'",
-      "form-action 'self'",
-    ].join("; "),
-  },
+  // Content-Security-Policy is now set in middleware.ts with a per-request
+  // nonce so inline scripts in layout.tsx and Next.js hydration work
+  // without unsafe-inline. The middleware also sets x-nonce header for
+  // layout consumption.
 ] as const;
 
 const nextConfig: NextConfig = {

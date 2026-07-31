@@ -1,23 +1,15 @@
 /**
- * In-memory per-key rate limiter.
+ * Rate limiter with optional Redis (Upstash REST API) backing.
  *
- * Fixed-window counter (not token bucket): every identifier gets a
- * fresh N-request budget each window. Simple, allocation-light, and
- * fine for a single-instance VPS — which is how forkers of this
- * template will usually deploy.
- *
- * Trade-off: a single Node process holds the Map, so horizontal scale
- * (multiple regions, multiple Hostinger nodes, Vercel serverless fan-
- * out) silently defeats the limit. If you scale beyond one instance,
- * swap the `check` implementation for Redis / Upstash / Cloudflare
- * Durable Objects keeping the same return shape. The call sites won't
- * change.
+ * `checkRateLimit` — synchronous, in-memory backend. Single-instance.
+ * `checkRateLimitWithRedis` — async, tries Upstash Redis first, degrades
+ *   to the same in-memory backend on any error so a Redis outage never
+ *   blocks requests.
  *
  * Memory: entries are ~50 bytes each. With LIGHT_SWEEP below, expired
- * keys get cleared opportunistically on every ~1 000th call, so a
- * healthy instance stays in the low-MB range even with thousands of
- * distinct users. No background timer — works in serverless edge
- * runtimes that don't keep timers alive across requests.
+ * keys get cleared opportunistically, so a healthy instance stays in
+ * the low-MB range even with thousands of distinct users. No background
+ * timer — works in serverless edge runtimes.
  */
 
 import { NextResponse } from 'next/server';
@@ -57,7 +49,11 @@ function sweepExpired(now: number) {
   }
 }
 
-export function checkRateLimit(
+// ---------------------------------------------------------------------------
+// In-memory backend (also used as the Redis fallback)
+// ---------------------------------------------------------------------------
+
+function checkRateLimitInMemory(
   key: string,
   { limit, windowMs }: RateLimitOptions,
 ): RateLimitResult {
@@ -88,6 +84,104 @@ export function checkRateLimit(
     limit,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Synchronous API (in-memory, single-instance)
+// ---------------------------------------------------------------------------
+
+export function checkRateLimit(
+  key: string,
+  options: RateLimitOptions,
+): RateLimitResult {
+  return checkRateLimitInMemory(key, options);
+}
+
+// ---------------------------------------------------------------------------
+// Async API with Upstash Redis backing + in-memory fallback
+// ---------------------------------------------------------------------------
+
+interface UpstashConfig {
+  url: string;
+  token: string;
+}
+
+function getUpstashConfig(): UpstashConfig | null {
+  const url = process.env.UPSTASH_REDIS_REST_URL?.trim();
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN?.trim();
+  return url && token ? { url, token } : null;
+}
+
+/**
+ * Send a single command to the Upstash REST API.
+ * Uses the REST-friendly URL format: `/<command>/<arg1>/<arg2>/...`
+ * Returns the parsed `result` string, or throws.
+ */
+async function upstashCommand(
+  args: string[],
+  { url, token }: UpstashConfig,
+): Promise<string> {
+  const encoded = args.map(encodeURIComponent).join('/');
+  const res = await fetch(`${url}/${encoded}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    throw new Error(`Upstash REST returned ${res.status}`);
+  }
+  const body = (await res.json()) as { result?: string; error?: string };
+  if (body.error) throw new Error(`Upstash error: ${body.error}`);
+  if (body.result === undefined) throw new Error('Upstash response missing result');
+  return body.result;
+}
+
+/**
+ * Async rate check that tries Upstash Redis first.
+ *
+ * Strategy:
+ * 1. INCR the key (scoped as `rate_limit:{key}`).
+ * 2. If the count === 1 (fresh window), set EXPIRE for the window seconds.
+ * 3. Derive `RateLimitResult` from the returned count.
+ * 4. On any failure (network, auth, unparseable) fall back to in-memory so
+ *    Redis is never a hard dependency.
+ */
+export async function checkRateLimitWithRedis(
+  key: string,
+  { limit, windowMs }: RateLimitOptions,
+): Promise<RateLimitResult> {
+  const cfg = getUpstashConfig();
+  if (!cfg) {
+    return checkRateLimitInMemory(key, { limit, windowMs });
+  }
+
+  try {
+    const redisKey = `rate_limit:${key}`;
+    const windowSec = Math.ceil(windowMs / 1000);
+    const countStr = await upstashCommand(['INCR', redisKey], cfg);
+    const count = Number.parseInt(countStr, 10);
+
+    // First request in the window — set expiry so Redis auto-cleans.
+    if (count === 1) {
+      // Fire-and-forget: we don't need to await the EXPIRE before returning.
+      upstashCommand(['EXPIRE', redisKey, String(windowSec)], cfg).catch(() => {
+        /* EXPIRE failure is non-fatal — the bucket lives forever but will
+           be overwritten when the window elapses locally. */
+      });
+    }
+
+    const now = Date.now();
+    return {
+      success: count <= limit,
+      remaining: Math.max(0, limit - count),
+      reset: now + windowMs,
+      limit,
+    };
+  } catch {
+    return checkRateLimitInMemory(key, { limit, windowMs });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP 429 response builder (shared by both backends)
+// ---------------------------------------------------------------------------
 
 /**
  * Standard 429 response with the headers clients expect (RFC 6585 +
