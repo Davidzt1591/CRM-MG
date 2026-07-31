@@ -72,22 +72,22 @@ describe('provider-registry', () => {
 
   // ── getProvider — returns MetaAdapter fallback for openwa (PR #2) ───
 
-  it('returns MetaAdapter fallback for provider=openwa (OpenWAAdapter comes in PR #2)', async () => {
+  it('returns OpenWAAdapter for provider=openwa', async () => {
     mockSingle.mockResolvedValueOnce({
       data: {
         provider: 'openwa',
         access_token: 'encrypted-openwa-token',
         phone_number_id: 'phone-789',
         waba_id: null,
-        provider_config: { apiUrl: 'http://localhost:2785' },
+        provider_config: { apiUrl: 'http://localhost:2785', apiKey: 'key', secret: 'secret' },
       },
       error: null,
     });
 
     const provider = await getProvider('acct-2');
 
-    expect(provider).toBeInstanceOf(MetaAdapter);
-    expect(provider.name).toBe('Meta Cloud API');
+    expect(provider.constructor.name).toBe('OpenWAAdapter');
+    expect(provider.name).toBe('OpenWA');
   });
 
   // ── getProvider — caching ────────────────────────────────────

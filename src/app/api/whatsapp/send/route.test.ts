@@ -154,10 +154,31 @@ vi.mock('@/lib/whatsapp/encryption', () => ({
 const { sendTemplateMessage } = vi.hoisted(() => ({
   sendTemplateMessage: vi.fn(async () => ({ messageId: 'wamid-1' })),
 }))
+
+// The send route no longer imports meta-api directly — it routes through
+// getProvider(). But other modules (e.g. parseMessageContent in the webhook
+// route) still import from meta-api, so keep the mock.
 vi.mock('@/lib/whatsapp/meta-api', () => ({
   sendTemplateMessage,
   sendTextMessage: vi.fn(),
   sendMediaMessage: vi.fn(),
+}))
+
+// Mock getProvider to return a controllable adapter that delegates to the
+// same sendTemplateMessage so existing assertions keep passing.
+vi.mock('@/lib/whatsapp/provider-registry', () => ({
+  getProvider: () => ({
+    name: 'Meta Cloud API',
+    sendText: vi.fn(async () => ({ messageId: 'wamid-text' })),
+    sendMedia: vi.fn(async () => ({ messageId: 'wamid-media' })),
+    sendTemplate: (...args: unknown[]) => sendTemplateMessage(...args),
+    sendInteractiveButtons: vi.fn(),
+    sendInteractiveList: vi.fn(),
+    sendReaction: vi.fn(),
+    processWebhook: vi.fn(),
+    verifyRequest: vi.fn(() => true),
+    getProviderStatus: vi.fn(),
+  }),
 }))
 
 import { POST } from './route'

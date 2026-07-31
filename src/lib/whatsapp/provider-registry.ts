@@ -10,6 +10,7 @@
 import { createClient } from '@supabase/supabase-js';
 import type { WhatsAppProvider } from './provider';
 import { MetaAdapter } from './meta-adapter';
+import { OpenWAAdapter } from './openwa-adapter';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -51,10 +52,10 @@ function supabaseAdmin() {
  *
  * Reads `whatsapp_config.provider` to determine which adapter to use:
  * - `'meta'`   → MetaAdapter (Meta Cloud API)
- * - `'openwa'` → currently returns MetaAdapter as fallback;
- *                 OpenWAAdapter comes in a follow-up PR.
+ * - `'openwa'` → OpenWAAdapter
  *
- * Throws if `whatsapp_config` is not found for the given account.
+ * Throws if `whatsapp_config` is not found for the given account, or if
+ * the provider type is unknown.
  */
 export async function getProvider(accountId: string): Promise<WhatsAppProvider> {
   const cached = cache.get(accountId);
@@ -73,13 +74,23 @@ export async function getProvider(accountId: string): Promise<WhatsAppProvider> 
     throw new Error(`WhatsApp config not found for account ${accountId}`);
   }
 
-  // Build the adapter based on the provider field.
-  // OpenWA support is stubbed until OpenWAAdapter is implemented in PR #2.
-  const provider: WhatsAppProvider = new MetaAdapter({
-    accessToken: data.access_token,
-    phoneNumberId: data.phone_number_id,
-    wabaId: data.waba_id,
-  });
+  let provider: WhatsAppProvider;
+
+  if (data.provider === 'openwa') {
+    const pc = data.provider_config as Record<string, string> | null;
+    provider = new OpenWAAdapter({
+      apiUrl: pc?.apiUrl ?? 'http://localhost:2785',
+      apiKey: pc?.apiKey ?? '',
+      secret: pc?.secret ?? '',
+    });
+  } else {
+    // Default to MetaAdapter for 'meta' or any unknown provider value.
+    provider = new MetaAdapter({
+      accessToken: data.access_token,
+      phoneNumberId: data.phone_number_id,
+      wabaId: data.waba_id,
+    });
+  }
 
   cache.set(accountId, { provider, expiresAt: Date.now() + TTL });
   return provider;
