@@ -212,6 +212,52 @@ describe("POST /api/conversations/[id]/transfer — notifications (Scenario C)",
     expect(String(memberSelect!.args[0])).toContain("profiles");
   });
 
+  it("pins every notification row to the caller's account and actor", async () => {
+    // Security guard for the 044 INSERT policy: the payload the route
+    // sends must satisfy the policy's WITH CHECK — account_id is the
+    // caller's account, recipients are same-account members, and
+    // actor_user_id is always the caller (never spoofed).
+    const fake = makeSupabase({
+      conversations: {
+        select: {
+          data: { id: "conv-1", account_id: "acct-1", department_id: "dept-1" },
+          error: null,
+        },
+        update: { data: null, error: null },
+      },
+      profile_departments: {
+        select: {
+          data: [
+            { profile_id: "prof-1", profiles: { user_id: "user-2" } },
+            { profile_id: "prof-2", profiles: { user_id: "user-3" } },
+          ],
+          error: null,
+        },
+      },
+      departments: { select: { data: { name: "Support" }, error: null } },
+      notifications: { insert: { data: null, error: null } },
+    });
+    createClient.mockReturnValue(fake);
+
+    const res = await POST(makeRequest(), {
+      params: Promise.resolve({ id: "conv-1" }),
+    });
+    expect(res.status).toBe(200);
+
+    const insertCall = fake.calls.find((c) => c.table === "notifications" && c.op === "insert");
+    const rows = insertCall!.args[0] as Array<Record<string, unknown>>;
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      // 1) Row belongs to the caller's account.
+      expect(row.account_id).toBe("acct-1");
+      // 2) Recipient is a member of that account (from the department
+      //    membership query), never a foreign user.
+      expect(["user-2", "user-3"]).toContain(row.user_id);
+      // 3) Actor pinned to the caller — satisfies actor_user_id = auth.uid().
+      expect(row.actor_user_id).toBe("user-1");
+    }
+  });
+
   it("still succeeds when the target department has no members (no insert)", async () => {
     const fake = makeSupabase({
       conversations: {
