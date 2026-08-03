@@ -82,6 +82,11 @@ export async function rotateEncryptedColumns(
   client: SupabaseClient,
   options: RotationOptions
 ): Promise<RotationSummary> {
+  if (options.apply) {
+    throw new Error(
+      'RPC orchestration not enabled in this slice; direct apply is disabled.'
+    );
+  }
   const report = options.report ?? console.log;
   const pageSize = options.pageSize ?? DEFAULT_PAGE_SIZE;
   const summary: RotationSummary = { planned: 0, rotated: 0, skipped: 0 };
@@ -135,38 +140,10 @@ export async function rotateEncryptedColumns(
         }
 
         try {
-          const rotated = targets.values.map(({ key, value }) => ({
-            key,
-            value: reEncrypt(value, { legacyKey: options.legacyCbcKey }),
-          }));
-          if (!options.apply) {
-            report(`[dry-run] ${entry.table}.${entry.column} row ${row.id}`);
-            continue;
+          for (const { value } of targets.values) {
+            reEncrypt(value, { legacyKey: options.legacyCbcKey });
           }
-
-          const original = row[entry.column];
-          let replacement: unknown = rotated[0].value;
-          if ('jsonKeys' in entry) {
-            replacement = { ...(original as Record<string, unknown>) };
-            for (const value of rotated) {
-              (replacement as Record<string, unknown>)[value.key!] =
-                value.value;
-            }
-          }
-
-          const { data: updated, error: updateError } = await client
-            .from(entry.table)
-            .update({ [entry.column]: replacement })
-            .eq('id', row.id)
-            .eq(entry.column, original)
-            .select('id');
-          if (updateError) throw updateError;
-          if (!updated || updated.length !== 1) {
-            throw new Error('concurrent update conflict');
-          }
-
-          summary.rotated += targets.values.length;
-          report(`[rotated] ${entry.table}.${entry.column} row ${row.id}`);
+          report(`[dry-run] ${entry.table}.${entry.column} row ${row.id}`);
         } catch (error) {
           summary.skipped += targets.values.length;
           const message =

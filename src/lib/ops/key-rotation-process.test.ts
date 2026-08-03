@@ -90,23 +90,23 @@ describe('actual key rotation package entrypoint', () => {
     expect(result.requests).toBe(12);
   }, 30_000);
 
-  it('accepts explicit --apply through the package script', async () => {
+  it('fails closed for --apply before making any database request', async () => {
     const result = await runActualCli(['--apply']);
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stderr).toBe('');
-    expect(result.stdout).toContain(
-      'Key rotation complete: 0 planned, 0 rotated, 0 skipped.'
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain(
+      'RPC orchestration not enabled in this slice; --apply is disabled.'
     );
-    expect(result.requests).toBe(12);
+    expect(result.stdout).not.toContain('Key rotation complete');
+    expect(result.requests).toBe(0);
   }, 30_000);
 
-  it('returns nonzero from the actual process when a row is skipped', async () => {
+  it('cannot reach a direct mutation path even when target rows are present', async () => {
     const result = await runActualCli(['--apply'], true);
 
     expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain('Key rotation incomplete');
+    expect(result.stderr).toContain('RPC orchestration not enabled');
     expect(result.stdout).not.toContain('Key rotation complete');
-    expect(result.requests).toBe(12);
+    expect(result.requests).toBe(0);
   }, 30_000);
 });

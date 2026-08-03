@@ -35,6 +35,9 @@ describe('key rotation CLI contract', () => {
 
     expect(result.exitCode).toBe(0);
     expect(result.stdout.join('\n')).toContain('Usage:');
+    expect(result.stdout.join('\n')).toContain(
+      '--apply is disabled until RPC orchestration is implemented'
+    );
     expect(result.createClient).not.toHaveBeenCalled();
   });
 
@@ -60,43 +63,42 @@ describe('key rotation CLI contract', () => {
     );
   });
 
-  it('applies only with --apply and reports successful output', async () => {
+  it('rejects --apply before creating a client or invoking direct rotation', async () => {
     const result = await run(['--apply'], {
       planned: 2,
       rotated: 2,
       skipped: 0,
     });
 
-    expect(result.exitCode).toBe(0);
-    expect(result.rotate).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({ apply: true })
-    );
-    expect(result.stdout.at(-1)).toContain('Key rotation complete');
-  });
-
-  it('returns nonzero and never claims success when apply leaves skipped rows', async () => {
-    const result = await run(['--apply'], {
-      planned: 2,
-      rotated: 1,
-      skipped: 1,
-    });
-
     expect(result.exitCode).toBe(1);
-    expect(result.stderr.at(-1)).toContain('incomplete');
+    expect(result.stderr).toEqual([
+      'RPC orchestration not enabled in this slice; --apply is disabled.',
+    ]);
+    expect(result.createClient).not.toHaveBeenCalled();
+    expect(result.rotate).not.toHaveBeenCalled();
     expect(result.stdout.join('\n')).not.toContain('Key rotation complete');
   });
 
-  it('passes explicit previous-key ownership for legacy CBC rows', async () => {
-    const result = await run(
-      ['--apply', '--legacy-cbc-key=previous'],
-      undefined,
-      { ...VALID_ENV, ENCRYPTION_KEY_PREVIOUS: 'b'.repeat(64) }
-    );
+  it('rejects --apply before environment validation can expose a direct path', async () => {
+    const result = await run(['--apply'], undefined, {});
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toEqual([
+      'RPC orchestration not enabled in this slice; --apply is disabled.',
+    ]);
+    expect(result.createClient).not.toHaveBeenCalled();
+    expect(result.rotate).not.toHaveBeenCalled();
+  });
+
+  it('keeps legacy ownership validation available only for harmless dry-runs', async () => {
+    const result = await run(['--legacy-cbc-key=previous'], undefined, {
+      ...VALID_ENV,
+      ENCRYPTION_KEY_PREVIOUS: 'b'.repeat(64),
+    });
 
     expect(result.rotate).toHaveBeenCalledWith(
       expect.anything(),
-      expect.objectContaining({ legacyCbcKey: 'previous' })
+      expect.objectContaining({ apply: false, legacyCbcKey: 'previous' })
     );
   });
 

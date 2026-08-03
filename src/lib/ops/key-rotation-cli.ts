@@ -27,8 +27,9 @@ type CliDependencies = {
 
 const USAGE = `Usage: npm run rotate-keys -- [--apply] [--legacy-cbc-key=current|previous]
 
-Runs a dry-run by default. Writes require --apply. Legacy CBC values require
-explicit key ownership whenever ENCRYPTION_KEY_PREVIOUS is configured.`;
+Runs a read-only dry-run by default. --apply is disabled until RPC orchestration is implemented
+in the next slice. Legacy CBC values require explicit key ownership whenever
+ENCRYPTION_KEY_PREVIOUS is configured.`;
 
 function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = { apply: false, help: false };
@@ -88,6 +89,13 @@ export async function runKeyRotationCli(
   if (options.help) {
     dependencies.stdout(USAGE);
     return 0;
+  }
+
+  if (options.apply) {
+    dependencies.stderr(
+      'RPC orchestration not enabled in this slice; --apply is disabled.'
+    );
+    return 1;
   }
 
   const environmentErrors = validateEnvironment(dependencies.env, options);

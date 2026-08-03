@@ -136,8 +136,8 @@ describe('key rotation operations', () => {
     ]);
   });
 
-  it('exercises all 13 encrypted values and performs 12 atomic column updates per run', async () => {
-    const { decrypt, encrypt } = await import('../whatsapp/encryption');
+  it('inventories all 13 encrypted values without mutating in dry-run mode', async () => {
+    const { encrypt } = await import('../whatsapp/encryption');
     const { rotateEncryptedColumns } = await loadModule();
     const secret = (name: string) => encrypt(name);
     const fake = createFakeClient({
@@ -174,32 +174,28 @@ describe('key rotation operations', () => {
       webhook_endpoints: [{ id: 'hook', secret: secret('hook-secret') }],
     });
 
-    const first = await rotateEncryptedColumns(fake.client, { apply: true });
-    const second = await rotateEncryptedColumns(fake.client, { apply: true });
+    const first = await rotateEncryptedColumns(fake.client, { apply: false });
+    const second = await rotateEncryptedColumns(fake.client, { apply: false });
 
-    expect(first).toEqual({ planned: 13, rotated: 13, skipped: 0 });
+    expect(first).toEqual({ planned: 13, rotated: 0, skipped: 0 });
     expect(second).toEqual(first);
-    expect(fake.updates).toHaveLength(24);
-    const whatsapp = fake.tables.whatsapp_config[0];
-    const salesforce = fake.tables.salesforce_config[0];
-    const ai = fake.tables.ai_configs[0];
-    const provider = whatsapp.provider_config as Record<string, string>;
-    expect(decrypt(whatsapp.access_token as string)).toBe('access');
-    expect(decrypt(whatsapp.verify_token as string)).toBe('verify');
-    expect(provider.region).toBe('us');
-    expect(decrypt(provider.apiKey)).toBe('provider-api');
-    expect(decrypt(provider.secret)).toBe('provider-secret');
-    expect(decrypt(salesforce.client_id as string)).toBe('client-id');
-    expect(decrypt(salesforce.client_secret as string)).toBe('client-secret');
-    expect(decrypt(salesforce.username as string)).toBe('username');
-    expect(decrypt(salesforce.password as string)).toBe('password');
-    expect(decrypt(salesforce.security_token as string)).toBe('security-token');
-    expect(decrypt(salesforce.webhook_secret as string)).toBe('webhook-secret');
-    expect(decrypt(ai.api_key as string)).toBe('ai-key');
-    expect(decrypt(ai.embeddings_api_key as string)).toBe('embeddings-key');
-    expect(decrypt(fake.tables.webhook_endpoints[0].secret as string)).toBe(
-      'hook-secret'
+    expect(fake.updates).toHaveLength(0);
+  });
+
+  it('rejects direct apply before querying or updating encrypted tables', async () => {
+    const { rotateEncryptedColumns } = await loadModule();
+    const from = vi.fn(() => {
+      throw new Error('direct table access must be unreachable');
+    });
+
+    await expect(
+      rotateEncryptedColumns({ from } as unknown as SupabaseClient, {
+        apply: true,
+      })
+    ).rejects.toThrow(
+      'RPC orchestration not enabled in this slice; direct apply is disabled.'
     );
+    expect(from).not.toHaveBeenCalled();
   });
 
   it('defaults to dry-run behavior without any update', async () => {
@@ -255,12 +251,12 @@ describe('key rotation operations', () => {
     });
 
     const summary = await rotateEncryptedColumns(fake.client, {
-      apply: true,
+      apply: false,
       pageSize: 2,
     });
 
-    expect(summary).toEqual({ planned: 2, rotated: 2, skipped: 0 });
-    expect(fake.updates).toHaveLength(2);
+    expect(summary).toEqual({ planned: 2, rotated: 0, skipped: 0 });
+    expect(fake.updates).toHaveLength(0);
     expect(
       fake.ranges.filter(
         (range) =>
@@ -291,43 +287,6 @@ describe('key rotation operations', () => {
     ).rejects.toThrow(/select failed/i);
   });
 
-  it('continues after update errors and reports a skipped row', async () => {
-    const { decrypt, encrypt } = await import('../whatsapp/encryption');
-    const { rotateEncryptedColumns } = await loadModule();
-    const fake = createFakeClient(
-      {
-        webhook_endpoints: [
-          { id: 'bad', secret: encrypt('bad') },
-          { id: 'good', secret: encrypt('good') },
-        ],
-      },
-      { updateErrorIds: ['bad'] }
-    );
-
-    const summary = await rotateEncryptedColumns(fake.client, { apply: true });
-
-    expect(summary).toEqual({ planned: 2, rotated: 1, skipped: 1 });
-    expect(decrypt(fake.tables.webhook_endpoints[1].secret as string)).toBe(
-      'good'
-    );
-  });
-
-  it('treats a compare-and-set conflict as skipped without a stale write', async () => {
-    const { encrypt } = await import('../whatsapp/encryption');
-    const { rotateEncryptedColumns } = await loadModule();
-    const original = encrypt('original');
-    const fake = createFakeClient(
-      { webhook_endpoints: [{ id: 'conflict', secret: original }] },
-      { conflictIds: ['conflict'] }
-    );
-
-    const summary = await rotateEncryptedColumns(fake.client, { apply: true });
-
-    expect(summary).toEqual({ planned: 1, rotated: 0, skipped: 1 });
-    expect(fake.tables.webhook_endpoints[0].secret).toBe(original);
-    expect(fake.updates).toHaveLength(0);
-  });
-
   it('counts present malformed JSON targets as skipped but ignores absent optional targets', async () => {
     const { encrypt } = await import('../whatsapp/encryption');
     const { rotateEncryptedColumns } = await loadModule();
@@ -340,9 +299,9 @@ describe('key rotation operations', () => {
       ],
     });
 
-    const summary = await rotateEncryptedColumns(fake.client, { apply: true });
+    const summary = await rotateEncryptedColumns(fake.client, { apply: false });
 
-    expect(summary).toEqual({ planned: 4, rotated: 1, skipped: 3 });
-    expect(fake.updates).toHaveLength(1);
+    expect(summary).toEqual({ planned: 4, rotated: 0, skipped: 3 });
+    expect(fake.updates).toHaveLength(0);
   });
 });
