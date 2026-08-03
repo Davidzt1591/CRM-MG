@@ -463,6 +463,8 @@ describe('046 key rotation database contract — lifecycle and concurrency', () 
     expect(concurrency).toContain('pg_locks');
     expect(concurrency).toContain('lock_timeout');
     expect(concurrency).not.toContain('pg_sleep');
+    expect(concurrency).toMatch(/^\s*BEGIN\s*;/m);
+    expect(concurrency).toMatch(/finish\s*\(\s*\)\s*;\s*ROLLBACK\s*;?\s*$/m);
     expect(documentation).toContain(
       'control → account barrier → run → item → encrypted row'
     );

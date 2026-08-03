@@ -1,6 +1,11 @@
 -- Deterministic two-session tests for the key-rotation write barrier.
 -- Synchronization observes PostgreSQL lock state with bounded polling; no test
 -- infers blocking from a fixed sleep.
+-- Wrap the entire suite in a single transaction so teardown (ROLLBACK)
+-- always runs even if an assertion fails partway through, matching the
+-- key_rotation_ops suite. This makes the test self-cleaning on re-runs.
+BEGIN;
+
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 CREATE EXTENSION IF NOT EXISTS dblink WITH SCHEMA extensions;
 SET search_path = public, extensions;
@@ -423,3 +428,4 @@ DELETE FROM accounts WHERE id = '82000000-0000-0000-0000-000000000001';
 DELETE FROM auth.users WHERE id::TEXT LIKE '81000000-%';
 SELECT set_config('app.key_rotation_purge', '', FALSE);
 SELECT * FROM finish();
+ROLLBACK;
