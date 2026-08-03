@@ -3,7 +3,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(25);
+SELECT plan(35);
 
 -- Task 4.1 — expand-only schema and least-privilege foundation.
 SELECT has_table('public', 'rotation_runs', 'rotation_runs exists');
@@ -50,6 +50,79 @@ SELECT is(
 SELECT ok(
   (SELECT purge_after IS NULL FROM rotation_runs LIMIT 1) IS NOT FALSE,
   'retention timestamp is nullable until retirement'
+);
+
+-- Task 4.2 — fixed service-only RPC and safe privileges.
+SELECT has_function(
+  'public',
+  'rotate_encrypted_row',
+  ARRAY['uuid', 'uuid', 'text', 'uuid', 'bigint', 'uuid', 'jsonb']
+);
+SELECT ok(
+  has_function_privilege(
+    'service_role',
+    'public.rotate_encrypted_row(uuid,uuid,text,uuid,bigint,uuid,jsonb)',
+    'EXECUTE'
+  ),
+  'service role can execute rotation RPC'
+);
+SELECT ok(
+  NOT has_function_privilege(
+    'authenticated',
+    'public.rotate_encrypted_row(uuid,uuid,text,uuid,bigint,uuid,jsonb)',
+    'EXECUTE'
+  ),
+  'authenticated cannot execute rotation RPC'
+);
+SELECT ok(
+  NOT has_function_privilege(
+    'anon',
+    'public.rotate_encrypted_row(uuid,uuid,text,uuid,bigint,uuid,jsonb)',
+    'EXECUTE'
+  ),
+  'anon cannot execute rotation RPC'
+);
+
+SELECT lives_ok(
+  $$UPDATE rotation_runtime_control
+    SET operations_enabled = TRUE, disabled_reason = 'maintenance'
+    WHERE singleton$$,
+  'test enables the otherwise inert contract locally'
+);
+
+SELECT throws_ok(
+  $$SELECT * FROM rotate_encrypted_row(
+    gen_random_uuid(), gen_random_uuid(), 'contacts', gen_random_uuid(),
+    0, gen_random_uuid(), '{}'::jsonb
+  )$$,
+  '42501',
+  'key rotation authorization failed',
+  'non-service caller is rejected before payload handling'
+);
+
+SELECT ok(
+  pg_get_functiondef(
+    'rotate_encrypted_row(uuid,uuid,text,uuid,bigint,uuid,jsonb)'::regprocedure
+  ) !~* 'execute[[:space:]]+format',
+  'RPC has no dynamic SQL table interpolation'
+);
+SELECT ok(
+  pg_get_functiondef(
+    'rotate_encrypted_row(uuid,uuid,text,uuid,bigint,uuid,jsonb)'::regprocedure
+  ) !~* 'raise[^;]*(p_values|sqlerrm)',
+  'RPC errors cannot echo values or raw database errors'
+);
+SELECT ok(
+  pg_get_functiondef(
+    'rotate_encrypted_row(uuid,uuid,text,uuid,bigint,uuid,jsonb)'::regprocedure
+  ) ~ 'secret_version = p_expected_version',
+  'RPC compares the non-secret version'
+);
+SELECT ok(
+  pg_get_functiondef(
+    'rotate_encrypted_row(uuid,uuid,text,uuid,bigint,uuid,jsonb)'::regprocedure
+  ) ~ 'secret_fingerprint = p_expected_fingerprint',
+  'RPC compares the opaque fingerprint'
 );
 
 SELECT * FROM finish();

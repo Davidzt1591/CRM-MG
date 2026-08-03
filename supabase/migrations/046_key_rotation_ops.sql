@@ -401,3 +401,316 @@ GRANT EXECUTE ON FUNCTION assert_key_rotation_rollback_safe() TO service_role;
 -- No DROP statements belong in this production migration. If a fix-forward
 -- rollback is ever proposed, call assert_key_rotation_rollback_safe() first;
 -- retained or active evidence deliberately blocks destructive reversal.
+
+-- ============================================================
+-- Task 4.2 — atomic, idempotent, service-role-only row rotation
+-- ============================================================
+CREATE FUNCTION rotate_encrypted_row(
+  p_run_id UUID,
+  p_item_id UUID,
+  p_table TEXT,
+  p_row_id UUID,
+  p_expected_version BIGINT,
+  p_expected_fingerprint UUID,
+  p_values JSONB
+)
+RETURNS TABLE (
+  outcome TEXT,
+  account_id UUID,
+  new_version BIGINT,
+  new_fingerprint UUID,
+  reason_code TEXT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_operations_enabled BOOLEAN;
+  v_run_status TEXT;
+  v_item_status TEXT;
+  v_item_table TEXT;
+  v_item_row_id UUID;
+  v_account_id UUID;
+  v_expected_version BIGINT;
+  v_expected_fingerprint UUID;
+  v_target_paths TEXT[];
+  v_payload_paths TEXT[];
+  v_new_version BIGINT;
+  v_new_fingerprint UUID;
+  v_provider_config JSONB;
+  v_row_exists BOOLEAN := FALSE;
+BEGIN
+  IF auth.role() <> 'service_role' THEN
+    RAISE EXCEPTION 'key rotation authorization failed' USING ERRCODE = '42501';
+  END IF;
+
+  SELECT operations_enabled
+  INTO v_operations_enabled
+  FROM rotation_runtime_control
+  WHERE singleton;
+
+  SELECT
+    r.status,
+    i.status,
+    i.table_name,
+    i.row_id,
+    i.account_id,
+    i.expected_version,
+    i.expected_fingerprint,
+    i.target_paths
+  INTO
+    v_run_status,
+    v_item_status,
+    v_item_table,
+    v_item_row_id,
+    v_account_id,
+    v_expected_version,
+    v_expected_fingerprint,
+    v_target_paths
+  FROM rotation_items i
+  JOIN rotation_runs r ON r.id = i.run_id
+  WHERE i.run_id = p_run_id
+    AND i.id = p_item_id
+  FOR UPDATE OF i;
+
+  IF NOT FOUND OR
+     v_item_table IS DISTINCT FROM p_table OR
+     v_item_row_id IS DISTINCT FROM p_row_id OR
+     v_expected_version IS DISTINCT FROM p_expected_version OR
+     v_expected_fingerprint IS DISTINCT FROM p_expected_fingerprint THEN
+    RETURN QUERY SELECT
+      'rejected'::TEXT, NULL::UUID, NULL::BIGINT, NULL::UUID,
+      'invalid_payload'::TEXT;
+    RETURN;
+  END IF;
+
+  IF v_item_status = 'applied' THEN
+    INSERT INTO rotation_audit_events (
+      run_id, item_id, account_id, actor_id, event_type, status, reason_code
+    ) VALUES (
+      p_run_id, p_item_id, v_account_id, auth.uid(),
+      'item_replayed', 'accepted', 'already_applied'
+    );
+    RETURN QUERY
+    SELECT
+      'already_applied'::TEXT,
+      v_account_id,
+      i.applied_version,
+      i.applied_fingerprint,
+      'already_applied'::TEXT
+    FROM rotation_items i
+    WHERE i.run_id = p_run_id AND i.id = p_item_id;
+    RETURN;
+  END IF;
+
+  IF NOT COALESCE(v_operations_enabled, FALSE) THEN
+    RETURN QUERY SELECT
+      'rejected'::TEXT, v_account_id, NULL::BIGINT, NULL::UUID,
+      'operations_disabled'::TEXT;
+    RETURN;
+  END IF;
+
+  IF v_run_status NOT IN ('approved', 'running') THEN
+    RETURN QUERY SELECT
+      'rejected'::TEXT, v_account_id, NULL::BIGINT, NULL::UUID,
+      'approval_required'::TEXT;
+    RETURN;
+  END IF;
+
+  IF jsonb_typeof(p_values) <> 'object' THEN
+    RAISE EXCEPTION 'rotation payload must be an object' USING ERRCODE = '22023';
+  END IF;
+
+  SELECT array_agg(key ORDER BY key)
+  INTO v_payload_paths
+  FROM jsonb_object_keys(p_values) AS keys(key);
+
+  IF v_payload_paths IS DISTINCT FROM (
+    SELECT array_agg(DISTINCT path ORDER BY path)
+    FROM unnest(v_target_paths) AS paths(path)
+  ) THEN
+    RAISE EXCEPTION 'rotation payload keys do not match the manifest item'
+      USING ERRCODE = '22023';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM jsonb_each(p_values) AS values_to_validate(path, encoded_value)
+    WHERE jsonb_typeof(encoded_value) <> 'string'
+       OR octet_length(encoded_value #>> '{}') > 16384
+       OR encoded_value #>> '{}' !~ '^[0-9a-f]{24}:[0-9a-f]*:[0-9a-f]{32}$'
+  ) THEN
+    RAISE EXCEPTION 'rotation payload contains an invalid encrypted value'
+      USING ERRCODE = '22023';
+  END IF;
+
+  -- Closed CASE p_table allow-list. No identifier or value is interpolated.
+  CASE p_table
+    WHEN 'whatsapp_config' THEN
+      SELECT COALESCE(w.provider_config, '{}'::JSONB)
+      INTO v_provider_config
+      FROM whatsapp_config w
+      WHERE w.id = p_row_id AND w.account_id = v_account_id;
+
+      IF p_values ? 'provider_config.apiKey' THEN
+        v_provider_config := jsonb_set(
+          v_provider_config,
+          '{apiKey}',
+          to_jsonb(p_values ->> 'provider_config.apiKey'),
+          TRUE
+        );
+      END IF;
+      IF p_values ? 'provider_config.secret' THEN
+        v_provider_config := jsonb_set(v_provider_config, '{secret}',
+          to_jsonb(p_values ->> 'provider_config.secret'), TRUE);
+      END IF;
+
+      UPDATE whatsapp_config
+      SET access_token = CASE
+            WHEN p_values ? 'access_token' THEN p_values ->> 'access_token'
+            ELSE access_token
+          END,
+          verify_token = CASE
+            WHEN p_values ? 'verify_token' THEN p_values ->> 'verify_token'
+            ELSE verify_token
+          END,
+          provider_config = v_provider_config
+      WHERE id = p_row_id
+        AND account_id = v_account_id
+        AND secret_version = p_expected_version
+        AND secret_fingerprint = p_expected_fingerprint
+      RETURNING whatsapp_config.account_id, secret_version, secret_fingerprint
+      INTO v_account_id, v_new_version, v_new_fingerprint;
+
+    WHEN 'salesforce_config' THEN
+      UPDATE salesforce_config
+      SET client_id = CASE WHEN p_values ? 'client_id'
+            THEN p_values ->> 'client_id' ELSE client_id END,
+          client_secret = CASE WHEN p_values ? 'client_secret'
+            THEN p_values ->> 'client_secret' ELSE client_secret END,
+          username = CASE WHEN p_values ? 'username'
+            THEN p_values ->> 'username' ELSE username END,
+          password = CASE WHEN p_values ? 'password'
+            THEN p_values ->> 'password' ELSE password END,
+          security_token = CASE WHEN p_values ? 'security_token'
+            THEN p_values ->> 'security_token' ELSE security_token END,
+          webhook_secret = CASE WHEN p_values ? 'webhook_secret'
+            THEN p_values ->> 'webhook_secret' ELSE webhook_secret END
+      WHERE id = p_row_id
+        AND account_id = v_account_id
+        AND secret_version = p_expected_version
+        AND secret_fingerprint = p_expected_fingerprint
+      RETURNING salesforce_config.account_id, secret_version, secret_fingerprint
+      INTO v_account_id, v_new_version, v_new_fingerprint;
+
+    WHEN 'ai_configs' THEN
+      UPDATE ai_configs
+      SET api_key = CASE WHEN p_values ? 'api_key'
+            THEN p_values ->> 'api_key' ELSE api_key END,
+          embeddings_api_key = CASE WHEN p_values ? 'embeddings_api_key'
+            THEN p_values ->> 'embeddings_api_key' ELSE embeddings_api_key END
+      WHERE id = p_row_id
+        AND account_id = v_account_id
+        AND secret_version = p_expected_version
+        AND secret_fingerprint = p_expected_fingerprint
+      RETURNING ai_configs.account_id, secret_version, secret_fingerprint
+      INTO v_account_id, v_new_version, v_new_fingerprint;
+
+    WHEN 'webhook_endpoints' THEN
+      UPDATE webhook_endpoints
+      SET secret = p_values ->> 'secret'
+      WHERE id = p_row_id
+        AND account_id = v_account_id
+        AND secret_version = p_expected_version
+        AND secret_fingerprint = p_expected_fingerprint
+      RETURNING webhook_endpoints.account_id, secret_version, secret_fingerprint
+      INTO v_account_id, v_new_version, v_new_fingerprint;
+
+    ELSE
+      RETURN QUERY SELECT
+        'rejected'::TEXT, v_account_id, NULL::BIGINT, NULL::UUID,
+        'invalid_payload'::TEXT;
+      RETURN;
+  END CASE;
+
+  IF v_new_version IS NULL THEN
+    CASE p_table
+      WHEN 'whatsapp_config' THEN
+        SELECT EXISTS (SELECT 1 FROM whatsapp_config
+          WHERE id = p_row_id AND account_id = v_account_id) INTO v_row_exists;
+      WHEN 'salesforce_config' THEN
+        SELECT EXISTS (SELECT 1 FROM salesforce_config
+          WHERE id = p_row_id AND account_id = v_account_id) INTO v_row_exists;
+      WHEN 'ai_configs' THEN
+        SELECT EXISTS (SELECT 1 FROM ai_configs
+          WHERE id = p_row_id AND account_id = v_account_id) INTO v_row_exists;
+      WHEN 'webhook_endpoints' THEN
+        SELECT EXISTS (SELECT 1 FROM webhook_endpoints
+          WHERE id = p_row_id AND account_id = v_account_id) INTO v_row_exists;
+      ELSE v_row_exists := FALSE;
+    END CASE;
+
+    UPDATE rotation_items
+    SET status = CASE WHEN v_row_exists THEN 'conflict' ELSE 'missing' END,
+        reason_code = CASE
+          WHEN v_row_exists THEN 'version_conflict' ELSE 'row_missing'
+        END,
+        attempts = attempts + 1,
+        first_attempted_at = COALESCE(first_attempted_at, now()),
+        terminal_at = now()
+    WHERE run_id = p_run_id AND id = p_item_id;
+
+    INSERT INTO rotation_audit_events (
+      run_id, item_id, account_id, actor_id, event_type, status, reason_code
+    ) VALUES (
+      p_run_id, p_item_id, v_account_id, auth.uid(),
+      CASE WHEN v_row_exists THEN 'item_conflict' ELSE 'item_missing' END,
+      'blocked',
+      CASE WHEN v_row_exists THEN 'version_conflict' ELSE 'row_missing' END
+    );
+
+    RETURN QUERY SELECT
+      CASE WHEN v_row_exists THEN 'conflict' ELSE 'missing' END::TEXT,
+      v_account_id,
+      NULL::BIGINT,
+      NULL::UUID,
+      CASE WHEN v_row_exists THEN 'version_conflict' ELSE 'row_missing' END::TEXT;
+    RETURN;
+  END IF;
+
+  UPDATE rotation_items
+  SET status = 'applied',
+      reason_code = 'applied',
+      attempts = attempts + 1,
+      first_attempted_at = COALESCE(first_attempted_at, now()),
+      applied_version = v_new_version,
+      applied_fingerprint = v_new_fingerprint,
+      terminal_at = now()
+  WHERE run_id = p_run_id AND id = p_item_id;
+
+  INSERT INTO rotation_audit_events (
+    run_id, item_id, account_id, actor_id, event_type, status, reason_code
+  ) VALUES (
+    p_run_id, p_item_id, v_account_id, auth.uid(),
+    'item_applied', 'applied', 'applied'
+  );
+
+  RETURN QUERY SELECT
+    'applied'::TEXT,
+    v_account_id,
+    v_new_version,
+    v_new_fingerprint,
+    'applied'::TEXT;
+END;
+$$;
+
+ALTER FUNCTION rotate_encrypted_row(
+  UUID, UUID, TEXT, UUID, BIGINT, UUID, JSONB
+) OWNER TO key_rotation_executor;
+REVOKE ALL ON FUNCTION rotate_encrypted_row(
+  UUID, UUID, TEXT, UUID, BIGINT, UUID, JSONB
+) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION rotate_encrypted_row(
+  UUID, UUID, TEXT, UUID, BIGINT, UUID, JSONB
+) TO service_role;

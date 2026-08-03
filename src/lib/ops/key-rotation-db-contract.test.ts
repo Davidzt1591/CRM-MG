@@ -97,3 +97,79 @@ describe('046 key rotation database contract — schema foundation', () => {
     );
   });
 });
+
+describe('046 key rotation database contract — atomic rotation RPC', () => {
+  it('defines the fixed service-role-only RPC signature and safe return fields', () => {
+    const sql = migration();
+
+    expect(sql).toContain('CREATE FUNCTION rotate_encrypted_row(');
+    expect(sql).toContain('p_expected_version BIGINT');
+    expect(sql).toContain('p_expected_fingerprint UUID');
+    expect(sql).toContain('p_values JSONB');
+    expect(sql).toMatch(
+      /RETURNS TABLE \(\s*outcome TEXT,\s*account_id UUID,\s*new_version BIGINT,\s*new_fingerprint UUID,\s*reason_code TEXT\s*\)/i
+    );
+    expect(sql).toContain("auth.role() <> 'service_role'");
+    expect(sql).toMatch(
+      /GRANT EXECUTE ON FUNCTION rotate_encrypted_row[\s\S]*?TO service_role/i
+    );
+    expect(sql).toMatch(
+      /REVOKE ALL ON FUNCTION rotate_encrypted_row[\s\S]*?FROM PUBLIC, anon, authenticated/i
+    );
+  });
+
+  it('uses a closed table/path allow-list and validates bounded GCM values', () => {
+    const sql = migration();
+
+    expect(sql).toContain("CASE p_table");
+    expect(sql).toContain("WHEN 'whatsapp_config'");
+    expect(sql).toContain("WHEN 'salesforce_config'");
+    expect(sql).toContain("WHEN 'ai_configs'");
+    expect(sql).toContain("WHEN 'webhook_endpoints'");
+    expect(sql).toContain("jsonb_typeof(p_values) <> 'object'");
+    expect(sql).toContain('rotation payload keys do not match the manifest item');
+    expect(sql).toMatch(/octet_length\([^)]*\) > 16384/);
+    expect(sql).toContain("^[0-9a-f]{24}:[0-9a-f]*:[0-9a-f]{32}$");
+    expect(sql).not.toMatch(/\bEXECUTE\s+format\s*\(/i);
+  });
+
+  it('performs version/fingerprint CAS and preserves unrelated provider JSON', () => {
+    const sql = migration();
+
+    expect(sql).toContain('secret_version = p_expected_version');
+    expect(sql).toContain('secret_fingerprint = p_expected_fingerprint');
+    expect(sql).toContain("v_provider_config,\n          '{apiKey}'");
+    expect(sql).toContain("jsonb_set(v_provider_config, '{secret}'");
+    expect(sql).toContain('provider_config = v_provider_config');
+    expect(sql).not.toMatch(/AND\s+\w+\s*=\s*p_values\s*->>/i);
+  });
+
+  it('returns safe replay, conflict, missing, rejected, and applied outcomes', () => {
+    const sql = migration();
+
+    for (const outcome of [
+      'applied',
+      'already_applied',
+      'conflict',
+      'missing',
+      'rejected',
+    ]) {
+      expect(sql).toContain(`'${outcome}'`);
+    }
+    expect(sql).toContain("v_item_status = 'applied'");
+    expect(sql).toContain("'item_replayed', 'accepted', 'already_applied'");
+  });
+
+  it('keeps value-bearing data out of audit inserts and error messages', () => {
+    const sql = migration();
+    const auditInserts = sql.match(
+      /INSERT INTO rotation_audit_events[\s\S]*?;/gi
+    );
+
+    expect(auditInserts).not.toBeNull();
+    for (const statement of auditInserts ?? []) {
+      expect(statement).not.toMatch(/p_values|plaintext|ciphertext/i);
+    }
+    expect(sql).not.toMatch(/RAISE[^;]*(?:p_values|SQLERRM)/i);
+  });
+});
