@@ -3,7 +3,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(65);
+SELECT plan(88);
 
 -- Task 4.1 — expand-only schema and least-privilege foundation.
 SELECT has_table('public', 'rotation_runs', 'rotation_runs exists');
@@ -99,6 +99,33 @@ SELECT throws_ok(
   'key rotation authorization failed',
   'non-service caller is rejected before payload handling'
 );
+SELECT set_config('request.jwt.claims', '{"role":123}', TRUE);
+SELECT throws_ok(
+  $$SELECT * FROM rotate_encrypted_row(
+    gen_random_uuid(), gen_random_uuid(), 'contacts', gen_random_uuid(),
+    0, gen_random_uuid(), '{}'::jsonb
+  )$$,
+  '42501', 'key rotation authorization failed',
+  'malformed role claims fail closed'
+);
+SELECT set_config('request.jwt.claims', '{"role":"anon"}', TRUE);
+SELECT throws_ok(
+  $$SELECT * FROM rotate_encrypted_row(
+    gen_random_uuid(), gen_random_uuid(), 'contacts', gen_random_uuid(),
+    0, gen_random_uuid(), '{}'::jsonb
+  )$$,
+  '42501', 'key rotation authorization failed',
+  'anon claims cannot call service-role rotation'
+);
+SELECT set_config('request.jwt.claims', '{"role":"authenticated"}', TRUE);
+SELECT throws_ok(
+  $$SELECT * FROM rotate_encrypted_row(
+    gen_random_uuid(), gen_random_uuid(), 'contacts', gen_random_uuid(),
+    0, gen_random_uuid(), '{}'::jsonb
+  )$$,
+  '42501', 'key rotation authorization failed',
+  'authenticated claims cannot call service-role rotation'
+);
 
 SELECT ok(
   pg_get_functiondef(
@@ -188,13 +215,19 @@ INSERT INTO auth.users (
   ('10000000-0000-0000-0000-000000000001', 'authenticated', 'authenticated',
    'rotation-preparer@example.test', '', '{}'::jsonb, '{}'::jsonb, now(), now()),
   ('10000000-0000-0000-0000-000000000002', 'authenticated', 'authenticated',
-   'rotation-approver@example.test', '', '{}'::jsonb, '{}'::jsonb, now(), now());
+   'rotation-approver@example.test', '', '{}'::jsonb, '{}'::jsonb, now(), now()),
+  ('10000000-0000-0000-0000-000000000003', 'authenticated', 'authenticated',
+   'rotation-outsider@example.test', '', '{}'::jsonb, '{}'::jsonb, now(), now());
 
 INSERT INTO accounts (id, name, owner_user_id)
 VALUES (
   '20000000-0000-0000-0000-000000000001',
   'Rotation test account',
   '10000000-0000-0000-0000-000000000001'
+), (
+  '20000000-0000-0000-0000-000000000002',
+  'Other rotation account',
+  '10000000-0000-0000-0000-000000000003'
 );
 
 INSERT INTO profiles (
@@ -207,20 +240,53 @@ INSERT INTO profiles (
   ('30000000-0000-0000-0000-000000000002',
    '10000000-0000-0000-0000-000000000002', 'Approver',
    'rotation-approver@example.test', '20000000-0000-0000-0000-000000000001',
-   'admin');
+    'admin'),
+  ('30000000-0000-0000-0000-000000000003',
+   '10000000-0000-0000-0000-000000000003', 'Outsider',
+   'rotation-outsider@example.test', '20000000-0000-0000-0000-000000000002',
+   'owner');
 
 INSERT INTO whatsapp_config (
-  id, user_id, account_id, phone_number_id, access_token, provider_config
+  id, user_id, account_id, phone_number_id, access_token, verify_token,
+  provider_config
 ) VALUES (
   '40000000-0000-0000-0000-000000000001',
   '10000000-0000-0000-0000-000000000001',
   '20000000-0000-0000-0000-000000000001',
   'rotation-test-phone',
   repeat('1', 24) || ':' || repeat('2', 32) || ':' || repeat('3', 32),
+  repeat('2', 24) || ':' || repeat('3', 32) || ':' || repeat('4', 32),
   jsonb_build_object(
     'apiKey', repeat('4', 24) || ':' || repeat('5', 32) || ':' || repeat('6', 32),
+    'secret', repeat('5', 24) || ':' || repeat('6', 32) || ':' || repeat('7', 32),
     'region', 'keep-me'
   )
+);
+
+INSERT INTO salesforce_config (
+  id, account_id, instance_url, client_id, client_secret, username,
+  password, security_token, webhook_secret
+) VALUES (
+  '40000000-0000-0000-0000-000000000003',
+  '20000000-0000-0000-0000-000000000001',
+  'https://salesforce.example.test',
+  repeat('1', 24) || ':' || repeat('1', 32) || ':' || repeat('1', 32),
+  repeat('2', 24) || ':' || repeat('2', 32) || ':' || repeat('2', 32),
+  repeat('3', 24) || ':' || repeat('3', 32) || ':' || repeat('3', 32),
+  repeat('4', 24) || ':' || repeat('4', 32) || ':' || repeat('4', 32),
+  repeat('5', 24) || ':' || repeat('5', 32) || ':' || repeat('5', 32),
+  repeat('6', 24) || ':' || repeat('6', 32) || ':' || repeat('6', 32)
+);
+
+INSERT INTO ai_configs (
+  id, account_id, created_by, provider, model, api_key, embeddings_api_key
+) VALUES (
+  '40000000-0000-0000-0000-000000000004',
+  '20000000-0000-0000-0000-000000000001',
+  '10000000-0000-0000-0000-000000000001',
+  'openai', 'test-model',
+  repeat('7', 24) || ':' || repeat('7', 32) || ':' || repeat('7', 32),
+  repeat('8', 24) || ':' || repeat('8', 32) || ':' || repeat('8', 32)
 );
 
 INSERT INTO webhook_endpoints (
@@ -234,13 +300,15 @@ INSERT INTO webhook_endpoints (
 );
 
 INSERT INTO rotation_runs (
-  id, account_id, mode, current_key_fingerprint, previous_key_fingerprint
+  id, account_id, mode, current_key_fingerprint, previous_key_fingerprint,
+  expected_items
 ) VALUES (
   '50000000-0000-0000-0000-000000000001',
   '20000000-0000-0000-0000-000000000001',
   'apply',
   '60000000-0000-0000-0000-000000000001',
-  '60000000-0000-0000-0000-000000000002'
+  '60000000-0000-0000-0000-000000000002',
+  4
 );
 
 INSERT INTO rotation_items (
@@ -254,7 +322,10 @@ SELECT
   account_id,
   'whatsapp_config',
   id,
-  ARRAY['access_token', 'provider_config.apiKey'],
+  ARRAY[
+    'access_token', 'verify_token', 'provider_config.apiKey',
+    'provider_config.secret'
+  ],
   secret_version,
   secret_fingerprint
 FROM whatsapp_config
@@ -277,55 +348,110 @@ SELECT
 FROM webhook_endpoints
 WHERE id = '40000000-0000-0000-0000-000000000002';
 
-CREATE TEMP TABLE rotation_test_manifest AS
-WITH source AS (
-  SELECT jsonb_build_array(
-    jsonb_build_object(
-      'account_id', '20000000-0000-0000-0000-000000000001',
-      'table_name', 'whatsapp_config',
-      'row_id', '40000000-0000-0000-0000-000000000001',
-      'value_path', 'access_token', 'value_format', 'gcm',
-      'legacy_owner', 'current',
-      'value_digest', encode(digest(convert_to(access_token, 'UTF8'), 'sha256'), 'hex')
-    ),
-    jsonb_build_object(
-      'account_id', '20000000-0000-0000-0000-000000000001',
-      'table_name', 'whatsapp_config',
-      'row_id', '40000000-0000-0000-0000-000000000001',
-      'value_path', 'provider_config.apiKey', 'value_format', 'gcm',
-      'legacy_owner', 'current',
-      'value_digest', encode(digest(convert_to(provider_config ->> 'apiKey', 'UTF8'), 'sha256'), 'hex')
-    ),
-    jsonb_build_object(
-      'account_id', '20000000-0000-0000-0000-000000000001',
-      'table_name', 'webhook_endpoints',
-      'row_id', '40000000-0000-0000-0000-000000000002',
-      'value_path', 'secret', 'value_format', 'gcm',
-      'legacy_owner', 'current',
-      'value_digest', encode(digest(convert_to(
-        (SELECT secret FROM webhook_endpoints
-         WHERE id = '40000000-0000-0000-0000-000000000002'),
-        'UTF8'
-      ), 'sha256'), 'hex')
-    )
-  ) AS entries
-  FROM whatsapp_config
-  WHERE id = '40000000-0000-0000-0000-000000000001'
-), canonical AS (
-  SELECT entries, (
-    SELECT jsonb_agg(entry ORDER BY
-      entry ->> 'account_id', entry ->> 'table_name', entry ->> 'row_id',
-      entry ->> 'value_path'
-    )
-    FROM jsonb_array_elements(entries) AS manifest_entries(entry)
-  ) AS canonical_entries
-  FROM source
+INSERT INTO rotation_items (
+  id, run_id, sequence, account_id, table_name, row_id, target_paths,
+  expected_version, expected_fingerprint
 )
 SELECT
-  entries,
-  encode(digest(convert_to(canonical_entries::text, 'UTF8'), 'sha256'), 'hex')
+  '70000000-0000-0000-0000-000000000003',
+  '50000000-0000-0000-0000-000000000001',
+  3,
+  account_id,
+  'salesforce_config',
+  id,
+  ARRAY[
+    'client_id', 'client_secret', 'username', 'password',
+    'security_token', 'webhook_secret'
+  ],
+  secret_version,
+  secret_fingerprint
+FROM salesforce_config
+WHERE id = '40000000-0000-0000-0000-000000000003';
+
+INSERT INTO rotation_items (
+  id, run_id, sequence, account_id, table_name, row_id, target_paths,
+  expected_version, expected_fingerprint
+)
+SELECT
+  '70000000-0000-0000-0000-000000000004',
+  '50000000-0000-0000-0000-000000000001',
+  4,
+  account_id,
+  'ai_configs',
+  id,
+  ARRAY['api_key', 'embeddings_api_key'],
+  secret_version,
+  secret_fingerprint
+FROM ai_configs
+WHERE id = '40000000-0000-0000-0000-000000000004';
+
+CREATE TEMP TABLE rotation_test_manifest AS
+WITH source_values AS (
+  SELECT
+    item.account_id,
+    item.table_name,
+    item.row_id,
+    path.value_path,
+    CASE item.table_name
+      WHEN 'whatsapp_config' THEN (
+        SELECT CASE path.value_path
+          WHEN 'access_token' THEN config.access_token
+          WHEN 'verify_token' THEN config.verify_token
+          WHEN 'provider_config.apiKey' THEN config.provider_config ->> 'apiKey'
+          WHEN 'provider_config.secret' THEN config.provider_config ->> 'secret'
+        END
+        FROM whatsapp_config AS config WHERE config.id = item.row_id
+      )
+      WHEN 'salesforce_config' THEN (
+        SELECT CASE path.value_path
+          WHEN 'client_id' THEN config.client_id
+          WHEN 'client_secret' THEN config.client_secret
+          WHEN 'username' THEN config.username
+          WHEN 'password' THEN config.password
+          WHEN 'security_token' THEN config.security_token
+          WHEN 'webhook_secret' THEN config.webhook_secret
+        END
+        FROM salesforce_config AS config WHERE config.id = item.row_id
+      )
+      WHEN 'ai_configs' THEN (
+        SELECT CASE path.value_path
+          WHEN 'api_key' THEN config.api_key
+          WHEN 'embeddings_api_key' THEN config.embeddings_api_key
+        END
+        FROM ai_configs AS config WHERE config.id = item.row_id
+      )
+      WHEN 'webhook_endpoints' THEN (
+        SELECT endpoint.secret FROM webhook_endpoints AS endpoint
+        WHERE endpoint.id = item.row_id AND path.value_path = 'secret'
+      )
+    END AS encrypted_value
+  FROM rotation_items AS item
+  CROSS JOIN LATERAL unnest(item.target_paths) AS path(value_path)
+  WHERE item.run_id = '50000000-0000-0000-0000-000000000001'
+), entries AS (
+  SELECT jsonb_agg(
+    jsonb_build_object(
+      'account_id', account_id::TEXT,
+      'table_name', table_name,
+      'row_id', row_id::TEXT,
+      'value_path', value_path,
+      'value_format', 'gcm',
+      'legacy_owner', 'current',
+      'value_digest', encode(
+        extensions.digest(convert_to(encrypted_value, 'UTF8'), 'sha256'),
+        'hex'
+      )
+    ) ORDER BY account_id, table_name, row_id, value_path
+  ) AS canonical_entries
+  FROM source_values
+)
+SELECT
+  canonical_entries AS entries,
+  encode(extensions.digest(
+    convert_to(canonical_entries::TEXT, 'UTF8'), 'sha256'
+  ), 'hex')
     AS manifest_digest
-FROM canonical;
+FROM entries;
 
 SELECT set_config(
   'request.jwt.claims',
@@ -370,6 +496,19 @@ SELECT is(
 
 SELECT set_config(
   'request.jwt.claims',
+  '{"role":"authenticated","sub":"10000000-0000-0000-0000-000000000003"}',
+  TRUE
+);
+SELECT throws_ok(
+  $$SELECT * FROM approve_rotation_manifest(
+    '50000000-0000-0000-0000-000000000001',
+    (SELECT manifest_digest FROM rotation_test_manifest), 'approved'
+  )$$,
+  '42501', 'manifest authorization failed',
+  'administrator from another account cannot approve the manifest'
+);
+SELECT set_config(
+  'request.jwt.claims',
   '{"role":"authenticated","sub":"10000000-0000-0000-0000-000000000002"}',
   TRUE
 );
@@ -380,6 +519,27 @@ SELECT is(
   )),
   'approved',
   'distinct account administrator approves manifest'
+);
+SELECT is(
+  (SELECT COUNT(*)::INTEGER
+   FROM rotation_manifest_entries
+   WHERE manifest_id = (
+     SELECT id FROM rotation_manifests
+     WHERE run_id = '50000000-0000-0000-0000-000000000001'
+     ORDER BY revision DESC LIMIT 1
+   )),
+  13,
+  'manifest contains every allow-listed encrypted value path'
+);
+SELECT ok(
+  (SELECT bool_and(rotation_manifest_entry_digest_matches(entry))
+   FROM rotation_manifest_entries AS entry
+   WHERE manifest_id = (
+     SELECT id FROM rotation_manifests
+     WHERE run_id = '50000000-0000-0000-0000-000000000001'
+     ORDER BY revision DESC LIMIT 1
+   )),
+  'digest helper executes successfully for all thirteen paths'
 );
 SELECT ok(
   rotation_item_has_approved_manifest(
@@ -442,6 +602,14 @@ SELECT set_config(
 );
 
 SELECT is(
+  (SELECT outcome FROM start_key_rotation_run(
+    '50000000-0000-0000-0000-000000000001'
+  )),
+  'started',
+  'approved run starts through the service-role lifecycle RPC'
+);
+
+SELECT is(
   (SELECT outcome FROM rotate_encrypted_row(
     '50000000-0000-0000-0000-000000000001',
     '70000000-0000-0000-0000-000000000001',
@@ -452,7 +620,9 @@ SELECT is(
      WHERE id = '70000000-0000-0000-0000-000000000001'),
     jsonb_build_object(
       'access_token', repeat('a', 24) || ':' || repeat('b', 32) || ':' || repeat('c', 32),
-      'provider_config.apiKey', repeat('d', 24) || ':' || repeat('e', 32) || ':' || repeat('f', 32)
+      'verify_token', repeat('b', 24) || ':' || repeat('c', 32) || ':' || repeat('d', 32),
+      'provider_config.apiKey', repeat('d', 24) || ':' || repeat('e', 32) || ':' || repeat('f', 32),
+      'provider_config.secret', repeat('e', 24) || ':' || repeat('f', 32) || ':' || repeat('0', 32)
     )
   )),
   'applied',
@@ -480,21 +650,136 @@ SELECT is(
     (SELECT expected_fingerprint FROM rotation_items
      WHERE id = '70000000-0000-0000-0000-000000000001'),
     jsonb_build_object(
-      'access_token', repeat('0', 24) || ':' || repeat('0', 32) || ':' || repeat('0', 32),
-      'provider_config.apiKey', repeat('0', 24) || ':' || repeat('0', 32) || ':' || repeat('0', 32)
+      'access_token', repeat('a', 24) || ':' || repeat('b', 32) || ':' || repeat('c', 32),
+      'verify_token', repeat('b', 24) || ':' || repeat('c', 32) || ':' || repeat('d', 32),
+      'provider_config.apiKey', repeat('d', 24) || ':' || repeat('e', 32) || ':' || repeat('f', 32),
+      'provider_config.secret', repeat('e', 24) || ':' || repeat('f', 32) || ':' || repeat('0', 32)
     )
   )),
   'already_applied',
-  'replay returns the committed result without rewriting'
+  'matching replay returns the committed result without rewriting'
+);
+SELECT is(
+  (SELECT outcome FROM rotate_encrypted_row(
+    '50000000-0000-0000-0000-000000000001',
+    '70000000-0000-0000-0000-000000000001',
+    'whatsapp_config',
+    '40000000-0000-0000-0000-000000000001',
+    0,
+    (SELECT expected_fingerprint FROM rotation_items
+     WHERE id = '70000000-0000-0000-0000-000000000001'),
+    jsonb_build_object(
+      'access_token', repeat('0', 24) || ':' || repeat('0', 32) || ':' || repeat('0', 32),
+      'verify_token', repeat('0', 24) || ':' || repeat('0', 32) || ':' || repeat('0', 32),
+      'provider_config.apiKey', repeat('0', 24) || ':' || repeat('0', 32) || ':' || repeat('0', 32),
+      'provider_config.secret', repeat('0', 24) || ':' || repeat('0', 32) || ':' || repeat('0', 32)
+    )
+  )),
+  'conflict',
+  'replay with a different replacement payload fails closed'
 );
 
-UPDATE webhook_endpoints
-SET secret = repeat('a', 24) || ':' || repeat('a', 32) || ':' || repeat('a', 32)
+SELECT is(
+  (SELECT outcome FROM rotate_encrypted_row(
+    '50000000-0000-0000-0000-000000000001',
+    '70000000-0000-0000-0000-000000000003',
+    'salesforce_config',
+    '40000000-0000-0000-0000-000000000003',
+    0,
+    (SELECT expected_fingerprint FROM rotation_items
+     WHERE id = '70000000-0000-0000-0000-000000000003'),
+    jsonb_build_object(
+      'client_id', repeat('a', 24) || ':' || repeat('1', 32) || ':' || repeat('2', 32),
+      'client_secret', repeat('b', 24) || ':' || repeat('2', 32) || ':' || repeat('3', 32),
+      'username', repeat('c', 24) || ':' || repeat('3', 32) || ':' || repeat('4', 32),
+      'password', repeat('d', 24) || ':' || repeat('4', 32) || ':' || repeat('5', 32),
+      'security_token', repeat('e', 24) || ':' || repeat('5', 32) || ':' || repeat('6', 32),
+      'webhook_secret', repeat('f', 24) || ':' || repeat('6', 32) || ':' || repeat('7', 32)
+    )
+  )),
+  'applied',
+  'Salesforce scalar values rotate atomically on the fresh schema'
+);
+SELECT is(
+  (SELECT webhook_secret FROM salesforce_config
+   WHERE id = '40000000-0000-0000-0000-000000000003'),
+  repeat('f', 24) || ':' || repeat('6', 32) || ':' || repeat('7', 32),
+  'Salesforce webhook_secret exists and receives the replacement value'
+);
+SELECT is(
+  (SELECT outcome FROM rotate_encrypted_row(
+    '50000000-0000-0000-0000-000000000001',
+    '70000000-0000-0000-0000-000000000004',
+    'ai_configs',
+    '40000000-0000-0000-0000-000000000004',
+    0,
+    (SELECT expected_fingerprint FROM rotation_items
+     WHERE id = '70000000-0000-0000-0000-000000000004'),
+    jsonb_build_object(
+      'api_key', repeat('1', 24) || ':' || repeat('a', 32) || ':' || repeat('b', 32),
+      'embeddings_api_key', repeat('2', 24) || ':' || repeat('b', 32) || ':' || repeat('c', 32)
+    )
+  )),
+  'applied',
+  'AI scalar values rotate atomically'
+);
+
+SELECT is(
+  (SELECT reason_code FROM rotate_encrypted_row(
+    '50000000-0000-0000-0000-000000000001',
+    '70000000-0000-0000-0000-000000000002',
+    'webhook_endpoints',
+    '40000000-0000-0000-0000-000000000002',
+    0,
+    (SELECT expected_fingerprint FROM rotation_items
+     WHERE id = '70000000-0000-0000-0000-000000000002'),
+    jsonb_build_object('secret', jsonb_build_object('not', 'ciphertext'))
+  )),
+  'invalid_payload',
+  'authorized malformed JSON value is rejected before any row write'
+);
+SELECT is(
+  (SELECT reason_code FROM rotation_audit_events
+   WHERE item_id = '70000000-0000-0000-0000-000000000002'
+   ORDER BY created_at DESC LIMIT 1),
+  'invalid_payload',
+  'invalid payload rejection leaves durable secret-free audit evidence'
+);
+SELECT is(
+  (SELECT reason_code FROM rotate_encrypted_row(
+    '50000000-0000-0000-0000-000000000001',
+    '70000000-0000-0000-0000-000000000002',
+    'webhook_endpoints',
+    '40000000-0000-0000-0000-000000000002',
+    0,
+    (SELECT expected_fingerprint FROM rotation_items
+     WHERE id = '70000000-0000-0000-0000-000000000002'),
+    jsonb_build_object('secret', repeat('a', 16385))
+  )),
+  'invalid_payload',
+  'oversized encrypted payload is rejected at the boundary'
+);
+SELECT is(
+  (SELECT reason_code FROM rotate_encrypted_row(
+    '50000000-0000-0000-0000-000000000001',
+    '70000000-0000-0000-0000-000000000002',
+    'webhook_endpoints',
+    '40000000-0000-0000-0000-000000000002',
+    0,
+    (SELECT expected_fingerprint FROM rotation_items
+     WHERE id = '70000000-0000-0000-0000-000000000002'),
+    jsonb_build_object('secret', 'not-gcm')
+  )),
+  'invalid_payload',
+  'malformed GCM encoding is rejected'
+);
+
+DELETE FROM webhook_endpoints
 WHERE id = '40000000-0000-0000-0000-000000000002';
 SELECT lives_ok(
-  $$SELECT secret_version FROM webhook_endpoints
-    WHERE id = '40000000-0000-0000-0000-000000000002'$$,
-  'concurrent secret update completes before stale RPC attempt'
+  $$SELECT 1 FROM rotation_items
+    WHERE id = '70000000-0000-0000-0000-000000000002'$$,
+  'snapshot item remains after its encrypted row is deleted'
 );
 SELECT is(
   (SELECT outcome FROM rotate_encrypted_row(
@@ -509,8 +794,8 @@ SELECT is(
       'secret', repeat('b', 24) || ':' || repeat('b', 32) || ':' || repeat('b', 32)
     )
   )),
-  'conflict',
-  'stale version/fingerprint produces a safe conflict'
+  'missing',
+  'deleted snapshot row produces a safe missing outcome'
 );
 
 SELECT throws_ok(
@@ -575,6 +860,179 @@ SELECT is(
   )),
   'unknown_ownership',
   'unknown CBC ownership fails closed'
+);
+
+-- Explicit mixed CBC ownership is accepted only when every row is bound.
+INSERT INTO webhook_endpoints (
+  id, account_id, created_by, url, secret
+) VALUES
+  ('40000000-0000-0000-0000-000000000005',
+   '20000000-0000-0000-0000-000000000001',
+   '10000000-0000-0000-0000-000000000001',
+   'https://rotation.invalid.test/cbc-current',
+   repeat('a', 32) || ':' || repeat('b', 32)),
+  ('40000000-0000-0000-0000-000000000006',
+   '20000000-0000-0000-0000-000000000001',
+   '10000000-0000-0000-0000-000000000001',
+   'https://rotation.invalid.test/cbc-previous',
+   repeat('c', 32) || ':' || repeat('d', 32));
+INSERT INTO rotation_runs (
+  id, account_id, mode, status, reason_code, current_key_fingerprint,
+  previous_key_fingerprint, expected_items
+) VALUES (
+  '50000000-0000-0000-0000-000000000008',
+  '20000000-0000-0000-0000-000000000001',
+  'apply', 'awaiting_approval', 'manifest_pending',
+  '60000000-0000-0000-0000-000000000001',
+  '60000000-0000-0000-0000-000000000002', 2
+);
+INSERT INTO rotation_items (
+  id, run_id, sequence, account_id, table_name, row_id, target_paths,
+  expected_version, expected_fingerprint
+)
+SELECT
+  CASE endpoint.id
+    WHEN '40000000-0000-0000-0000-000000000005'::UUID
+      THEN '70000000-0000-0000-0000-000000000005'::UUID
+    ELSE '70000000-0000-0000-0000-000000000006'::UUID
+  END,
+  '50000000-0000-0000-0000-000000000008',
+  row_number() OVER (ORDER BY endpoint.id), endpoint.account_id,
+  'webhook_endpoints', endpoint.id, ARRAY['secret'],
+  endpoint.secret_version, endpoint.secret_fingerprint
+FROM webhook_endpoints AS endpoint
+WHERE endpoint.id IN (
+  '40000000-0000-0000-0000-000000000005',
+  '40000000-0000-0000-0000-000000000006'
+);
+WITH manifest AS (
+  INSERT INTO rotation_manifests (
+    run_id, revision, preparer_id, manifest_digest, entry_count
+  ) VALUES (
+    '50000000-0000-0000-0000-000000000008', 1,
+    '10000000-0000-0000-0000-000000000001',
+    extensions.digest(convert_to('mixed-cbc', 'UTF8'), 'sha256'), 2
+  ) RETURNING id, manifest_digest
+)
+INSERT INTO rotation_manifest_entries (
+  manifest_id, run_id, account_id, table_name, row_id, value_path,
+  value_format, legacy_owner, value_digest
+)
+SELECT
+  manifest.id, '50000000-0000-0000-0000-000000000008',
+  endpoint.account_id, 'webhook_endpoints', endpoint.id, 'secret', 'cbc',
+  CASE endpoint.id
+    WHEN '40000000-0000-0000-0000-000000000005'::UUID THEN 'current'
+    ELSE 'previous'
+  END,
+  extensions.digest(convert_to(endpoint.secret, 'UTF8'), 'sha256')
+FROM manifest
+CROSS JOIN webhook_endpoints AS endpoint
+WHERE endpoint.id IN (
+  '40000000-0000-0000-0000-000000000005',
+  '40000000-0000-0000-0000-000000000006'
+);
+SELECT is(
+  (SELECT outcome FROM approve_rotation_manifest(
+    '50000000-0000-0000-0000-000000000008',
+    encode(extensions.digest(convert_to('mixed-cbc', 'UTF8'), 'sha256'), 'hex'),
+    'approved'
+  )),
+  'approved',
+  'row-scoped current and previous CBC ownership can coexist safely'
+);
+
+-- Complete executable lifecycle, monitoring, retention, purge, and replay.
+INSERT INTO rotation_runs (
+  id, account_id, mode, status, reason_code, current_key_fingerprint,
+  previous_key_fingerprint, expected_items, visited_items, terminal_items,
+  started_at
+) VALUES (
+  '50000000-0000-0000-0000-000000000009',
+  '20000000-0000-0000-0000-000000000001',
+  'final_audit', 'running', 'started',
+  '60000000-0000-0000-0000-000000000001',
+  '60000000-0000-0000-0000-000000000002',
+  0, 0, 0, now()
+);
+WITH manifest AS (
+  INSERT INTO rotation_manifests (
+    run_id, revision, preparer_id, manifest_digest, entry_count
+  ) VALUES (
+    '50000000-0000-0000-0000-000000000009', 1,
+    '10000000-0000-0000-0000-000000000001',
+    extensions.digest(convert_to('lifecycle', 'UTF8'), 'sha256'), 1
+  ) RETURNING id, run_id, manifest_digest
+)
+INSERT INTO rotation_manifest_approvals (
+  manifest_id, run_id, manifest_digest, decision, approver_id
+)
+SELECT id, run_id, manifest_digest, 'approved',
+  '10000000-0000-0000-0000-000000000002'
+FROM manifest;
+
+SELECT set_config(
+  'request.jwt.claims',
+  '{"role":"service_role","sub":"10000000-0000-0000-0000-000000000002"}',
+  TRUE
+);
+SELECT is(
+  (SELECT outcome FROM finalize_key_rotation_run(
+    '50000000-0000-0000-0000-000000000009'
+  )),
+  'completed',
+  'finalization atomically reconciles expected, visited, and terminal counts'
+);
+SELECT is(
+  (SELECT status FROM get_key_rotation_status(
+    '50000000-0000-0000-0000-000000000009'
+  )),
+  'completed',
+  'monitoring reads secret-safe aggregate status without table grants'
+);
+SELECT disable_key_rotation_operations('maintenance');
+SELECT is(
+  (SELECT outcome FROM confirm_previous_key_retirement(
+    '50000000-0000-0000-0000-000000000009'
+  )),
+  'retired',
+  'completed gate starts previous-key retirement retention'
+);
+SELECT is(
+  (SELECT reason_code FROM purge_rotation_evidence(
+    '50000000-0000-0000-0000-000000000009'
+  )),
+  'retention_active',
+  'purge is blocked immediately after retirement'
+);
+UPDATE rotation_runs
+SET previous_key_retired_at = now() - INTERVAL '89 days',
+    purge_after = now() + INTERVAL '1 day'
+WHERE id = '50000000-0000-0000-0000-000000000009';
+SELECT is(
+  (SELECT reason_code FROM purge_rotation_evidence(
+    '50000000-0000-0000-0000-000000000009'
+  )),
+  'retention_active',
+  'day-89 purge remains blocked'
+);
+UPDATE rotation_runs
+SET previous_key_retired_at = now() - INTERVAL '90 days',
+    purge_after = now()
+WHERE id = '50000000-0000-0000-0000-000000000009';
+SELECT is(
+  (SELECT outcome FROM purge_rotation_evidence(
+    '50000000-0000-0000-0000-000000000009'
+  )),
+  'purged',
+  'day-90 purge removes row-level evidence'
+);
+SELECT is(
+  (SELECT outcome FROM purge_rotation_evidence(
+    '50000000-0000-0000-0000-000000000009'
+  )),
+  'already_purged',
+  'purge replay is idempotent'
 );
 
 SELECT * FROM finish();
