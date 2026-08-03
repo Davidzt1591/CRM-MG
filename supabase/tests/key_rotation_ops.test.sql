@@ -3,7 +3,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(88);
+SELECT plan(104);
 
 -- Task 4.1 — expand-only schema and least-privilege foundation.
 SELECT has_table('public', 'rotation_runs', 'rotation_runs exists');
@@ -560,15 +560,15 @@ SELECT is(
     (SELECT manifest_digest FROM rotation_test_manifest),
     (SELECT entries FROM rotation_test_manifest)
   )),
-  'manifest_reimported',
-  'reimport creates a new revision and invalidates approval'
+  'manifest_replayed',
+  'identical import returns the existing revision'
 );
 SELECT ok(
-  NOT rotation_item_has_approved_manifest(
+  rotation_item_has_approved_manifest(
     '50000000-0000-0000-0000-000000000001',
     '70000000-0000-0000-0000-000000000001'
   ),
-  'older approval cannot authorize a reimported manifest'
+  'identical import preserves the existing approval'
 );
 
 SELECT set_config(
@@ -581,15 +581,15 @@ SELECT is(
     '50000000-0000-0000-0000-000000000001',
     (SELECT manifest_digest FROM rotation_test_manifest), 'approved'
   )),
-  'approved',
-  'latest revision receives its own approval'
+  'already_recorded',
+  'approval retry returns the existing approval'
 );
 SELECT ok(
   rotation_item_has_approved_manifest(
     '50000000-0000-0000-0000-000000000001',
     '70000000-0000-0000-0000-000000000001'
   ),
-  'latest approval restores item authorization'
+  'preserved approval keeps item authorization'
 );
 
 UPDATE rotation_runtime_control
@@ -658,6 +658,28 @@ SELECT is(
   )),
   'already_applied',
   'matching replay returns the committed result without rewriting'
+);
+UPDATE whatsapp_config
+SET access_token = repeat('9', 24) || ':' || repeat('8', 32) || ':' || repeat('7', 32)
+WHERE id = '40000000-0000-0000-0000-000000000001';
+SELECT is(
+  (SELECT reason_code FROM rotate_encrypted_row(
+    '50000000-0000-0000-0000-000000000001',
+    '70000000-0000-0000-0000-000000000001',
+    'whatsapp_config',
+    '40000000-0000-0000-0000-000000000001',
+    0,
+    (SELECT expected_fingerprint FROM rotation_items
+     WHERE id = '70000000-0000-0000-0000-000000000001'),
+    jsonb_build_object(
+      'access_token', repeat('a', 24) || ':' || repeat('b', 32) || ':' || repeat('c', 32),
+      'verify_token', repeat('b', 24) || ':' || repeat('c', 32) || ':' || repeat('d', 32),
+      'provider_config.apiKey', repeat('d', 24) || ':' || repeat('e', 32) || ':' || repeat('f', 32),
+      'provider_config.secret', repeat('e', 24) || ':' || repeat('f', 32) || ':' || repeat('0', 32)
+    )
+  )),
+  'version_conflict',
+  'applied replay revalidates locked current row metadata'
 );
 SELECT is(
   (SELECT outcome FROM rotate_encrypted_row(
@@ -942,6 +964,136 @@ SELECT is(
   'row-scoped current and previous CBC ownership can coexist safely'
 );
 
+-- Third remediation — mode safety, recoverable gates, public zero inventory,
+-- effective monitoring roles, and write-barrier triggers.
+SELECT set_config(
+  'request.jwt.claims',
+  '{"role":"service_role","sub":"10000000-0000-0000-0000-000000000002"}',
+  TRUE
+);
+CREATE TEMP TABLE read_only_run AS
+SELECT prepare_key_rotation_run(
+  '20000000-0000-0000-0000-000000000001', 'dry_run',
+  '60000000-0000-0000-0000-000000000001',
+  '60000000-0000-0000-0000-000000000002'
+) AS run_id;
+SELECT * FROM start_key_rotation_run((SELECT run_id FROM read_only_run));
+CREATE TEMP TABLE read_only_version AS
+SELECT secret_version
+FROM whatsapp_config
+WHERE id = '40000000-0000-0000-0000-000000000001';
+SELECT is(
+  (SELECT reason_code FROM rotate_encrypted_row(
+    (SELECT run_id FROM read_only_run),
+    (SELECT id FROM rotation_items
+     WHERE run_id = (SELECT run_id FROM read_only_run)
+       AND table_name = 'whatsapp_config' LIMIT 1),
+    'whatsapp_config', '40000000-0000-0000-0000-000000000001',
+    (SELECT expected_version FROM rotation_items
+     WHERE run_id = (SELECT run_id FROM read_only_run)
+       AND table_name = 'whatsapp_config' LIMIT 1),
+    (SELECT expected_fingerprint FROM rotation_items
+     WHERE run_id = (SELECT run_id FROM read_only_run)
+       AND table_name = 'whatsapp_config' LIMIT 1),
+    '{}'::jsonb
+  )),
+  'mode_read_only',
+  'dry-run mode rejects the mutating row RPC'
+);
+SELECT is(
+  (SELECT secret_version FROM whatsapp_config
+   WHERE id = '40000000-0000-0000-0000-000000000001'),
+  (SELECT secret_version FROM read_only_version),
+  'dry-run rejection performs no encrypted table update'
+);
+
+CREATE TEMP TABLE recovery_run AS
+SELECT prepare_key_rotation_run(
+  '20000000-0000-0000-0000-000000000001', 'dry_run',
+  '60000000-0000-0000-0000-000000000001',
+  '60000000-0000-0000-0000-000000000002'
+) AS run_id;
+SELECT * FROM start_key_rotation_run((SELECT run_id FROM recovery_run));
+UPDATE whatsapp_config
+SET access_token = repeat('9', 24) || ':' || repeat('8', 32) || ':' || repeat('7', 32)
+WHERE id = '40000000-0000-0000-0000-000000000001';
+SELECT is(
+  (SELECT reason_code FROM finalize_key_rotation_run(
+    (SELECT run_id FROM recovery_run)
+  )),
+  'inventory_changed',
+  'early finalization reports changed inventory'
+);
+SELECT is(
+  (SELECT status FROM get_key_rotation_status((SELECT run_id FROM recovery_run))),
+  'running',
+  'early finalization remains recoverable in running state'
+);
+
+CREATE TEMP TABLE zero_inventory_run AS
+SELECT prepare_key_rotation_run(
+  '20000000-0000-0000-0000-000000000002', 'final_audit',
+  '60000000-0000-0000-0000-000000000001', NULL
+) AS run_id;
+SELECT is(
+  (SELECT outcome FROM start_key_rotation_run(
+    (SELECT run_id FROM zero_inventory_run)
+  )),
+  'started',
+  'zero-inventory final audit starts through the public RPC'
+);
+SELECT is(
+  (SELECT outcome FROM finalize_key_rotation_run(
+    (SELECT run_id FROM zero_inventory_run)
+  )),
+  'completed',
+  'zero-inventory final audit finalizes through the public RPC'
+);
+SELECT ok(
+  (SELECT status = 'completed' AND expected_items = 0
+   FROM get_key_rotation_status((SELECT run_id FROM zero_inventory_run))),
+  'zero-inventory status is complete without direct evidence inserts'
+);
+
+SELECT ok(
+  (SELECT is_stuck FROM list_active_key_rotation_runs(INTERVAL '1 microsecond')
+   WHERE run_id = (SELECT run_id FROM recovery_run)),
+  'monitoring discovers a stuck recoverable run'
+);
+SELECT ok(
+  (SELECT error_events > 0 AND error_rate > 0
+   FROM get_key_rotation_audit_summary((SELECT run_id FROM recovery_run))),
+  'monitoring exposes aggregate gate error signals'
+);
+SELECT ok(
+  has_function_privilege(
+    'service_role', 'public.list_active_key_rotation_runs(interval)', 'EXECUTE'
+  ),
+  'service role can discover active and stuck runs'
+);
+SELECT ok(
+  NOT has_function_privilege(
+    'authenticated', 'public.get_key_rotation_audit_summary(uuid)', 'EXECUTE'
+  ),
+  'authenticated callers cannot read aggregate operational monitoring'
+);
+SELECT has_trigger(
+  'public', 'whatsapp_config', 'whatsapp_config_secret_metadata',
+  'WhatsApp writes participate in the secret barrier'
+);
+SELECT has_trigger(
+  'public', 'salesforce_config', 'salesforce_config_secret_metadata',
+  'Salesforce writes participate in the secret barrier'
+);
+SELECT has_trigger(
+  'public', 'ai_configs', 'ai_configs_secret_metadata',
+  'AI writes participate in the secret barrier'
+);
+SELECT has_trigger(
+  'public', 'webhook_endpoints', 'webhook_endpoints_secret_metadata',
+  'webhook writes participate in the secret barrier'
+);
+
 -- Complete executable lifecycle, monitoring, retention, purge, and replay.
 INSERT INTO rotation_runs (
   id, account_id, mode, status, reason_code, current_key_fingerprint,
@@ -949,7 +1101,7 @@ INSERT INTO rotation_runs (
   started_at
 ) VALUES (
   '50000000-0000-0000-0000-000000000009',
-  '20000000-0000-0000-0000-000000000001',
+  '20000000-0000-0000-0000-000000000002',
   'final_audit', 'running', 'started',
   '60000000-0000-0000-0000-000000000001',
   '60000000-0000-0000-0000-000000000002',

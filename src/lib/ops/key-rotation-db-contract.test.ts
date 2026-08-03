@@ -7,9 +7,14 @@ const migrationPath = join(
   'supabase/migrations/046_key_rotation_ops.sql'
 );
 const workflowPath = join(process.cwd(), '.github/workflows/ci.yml');
+const supabaseConfigPath = join(process.cwd(), 'supabase/config.toml');
 const concurrencyTestPath = join(
   process.cwd(),
   'supabase/tests/key_rotation_concurrency.test.sql'
+);
+const pgTapTestPath = join(
+  process.cwd(),
+  'supabase/tests/key_rotation_ops.test.sql'
 );
 const contractDocPath = join(process.cwd(), 'docs/key-rotation-db-contract.md');
 
@@ -19,6 +24,14 @@ function migration(): string {
 
 function workflow(): string {
   return readFileSync(workflowPath, 'utf8');
+}
+
+function functionDefinition(sql: string, name: string): string {
+  const match = sql.match(
+    new RegExp(`CREATE FUNCTION public\\.${name}\\([\\s\\S]*?\\n\\$\\$;`, 'i')
+  );
+  if (!match) throw new Error(`Missing function ${name}`);
+  return match[0];
 }
 
 function tableDefinition(sql: string, table: string): string {
@@ -172,9 +185,12 @@ describe('046 key rotation database contract — atomic rotation RPC', () => {
     expect(sql).toContain("WHEN 'webhook_endpoints'");
     expect(sql).toContain("jsonb_typeof(p_values) IS DISTINCT FROM 'object'");
     expect(sql).toContain("v_account_id, 'invalid_payload'");
-    expect(sql).toMatch(/octet_length\([^)]*\) > 16384/);
+    expect(sql).toMatch(/octet_length\([^)]*\) > v_max_ciphertext_bytes/);
     expect(sql).toContain('^[0-9a-f]{24}:[0-9a-f]*:[0-9a-f]{32}$');
     expect(sql).not.toMatch(/\bEXECUTE\s+format\s*\(/i);
+    expect(sql).toContain(
+      'v_max_ciphertext_bytes CONSTANT INTEGER := 16 * 1024'
+    );
   });
 
   it('performs version/fingerprint CAS and derives JSON updates from the locked row', () => {
@@ -206,6 +222,19 @@ describe('046 key rotation database contract — atomic rotation RPC', () => {
     expect(sql).toContain("'item_replayed', 'accepted', 'already_applied'");
     expect(sql).toContain('replacement_payload_digest');
     expect(sql).toContain("'payload_mismatch'");
+    expect(sql).toMatch(
+      /v_item_status = 'applied'[\s\S]*?rotation_item_matches_applied_metadata[\s\S]*?'item_replayed'/i
+    );
+  });
+
+  it('mutates encrypted rows only for a locked running apply run', () => {
+    const fn = functionDefinition(migration(), 'rotate_encrypted_row');
+
+    expect(fn).toMatch(/SELECT run\.status, run\.mode, run\.account_id/i);
+    expect(fn).toContain("v_run_mode IS DISTINCT FROM 'apply'");
+    expect(fn).toMatch(
+      /lock_key_rotation_account\(v_run_account_id\)[\s\S]*?lock_key_rotation_run\(p_run_id\)[\s\S]*?FOR UPDATE OF i/i
+    );
   });
 
   it('keeps value-bearing data out of audit inserts and error messages', () => {
@@ -262,10 +291,14 @@ describe('046 key rotation database contract — dual-control CBC manifests', ()
     expect(sql).toContain('rotation_manifest_approvals');
   });
 
-  it('invalidates prior approval by requiring the latest manifest revision', () => {
+  it('preserves approval on identical retries and invalidates it only for changed evidence', () => {
     const sql = migration();
 
     expect(sql).toContain('ORDER BY revision DESC');
+    expect(sql).toContain("'manifest_replayed'");
+    expect(sql).toMatch(
+      /manifest_digest = v_computed_digest[\s\S]*?RETURN QUERY SELECT[\s\S]*?v_existing_manifest_id/i
+    );
     expect(sql).toContain("status = 'awaiting_approval'");
     expect(sql).toContain("THEN 'manifest_reimported'");
     expect(sql).toContain('rotation_item_has_approved_manifest');
@@ -301,6 +334,8 @@ describe('046 key rotation database contract — lifecycle and concurrency', () 
       'confirm_previous_key_retirement',
       'purge_rotation_evidence',
       'get_key_rotation_status',
+      'list_active_key_rotation_runs',
+      'get_key_rotation_audit_summary',
     ]) {
       expect(sql).toContain(`CREATE FUNCTION public.${functionName}(`);
       expect(sql).toMatch(
@@ -320,8 +355,10 @@ describe('046 key rotation database contract — lifecycle and concurrency', () 
     const sql = migration();
 
     expect(sql).toContain(
-      'LOCK ORDER: control -> run -> item -> encrypted row'
+      'LOCK ORDER: control -> account barrier -> run -> item -> encrypted row'
     );
+    expect(sql).toContain('CREATE FUNCTION public.lock_key_rotation_account(');
+    expect(sql).toContain('pg_advisory_xact_lock');
     expect(sql).toContain('CREATE FUNCTION public.lock_key_rotation_control()');
     expect(sql).toContain('CREATE FUNCTION public.lock_key_rotation_run(');
     expect(sql).toContain('PERFORM public.lock_key_rotation_control()');
@@ -329,6 +366,76 @@ describe('046 key rotation database contract — lifecycle and concurrency', () 
     expect(sql).toMatch(
       /rotate_encrypted_row[\s\S]*?lock_key_rotation_control\(\)[\s\S]*?lock_key_rotation_run\(p_run_id\)[\s\S]*?FOR UPDATE OF i/i
     );
+  });
+
+  it('enforces the account barrier on normal secret inserts and changes only', () => {
+    const sql = migration();
+    const trigger = functionDefinition(
+      sql,
+      'bump_key_rotation_secret_metadata'
+    );
+
+    expect(trigger).toContain("TG_OP = 'INSERT'");
+    expect(trigger).toContain(
+      'public.lock_key_rotation_account(NEW.account_id)'
+    );
+    expect(trigger).toMatch(
+      /IF encrypted_value_changed THEN[\s\S]*?lock_key_rotation_account/i
+    );
+    for (const table of [
+      'whatsapp_config',
+      'salesforce_config',
+      'ai_configs',
+      'webhook_endpoints',
+    ]) {
+      expect(sql).toContain(`BEFORE INSERT OR UPDATE ON ${table}`);
+    }
+  });
+
+  it('reconciles actual inventory under the barrier before finalization and retirement', () => {
+    const sql = migration();
+    const finalize = functionDefinition(sql, 'finalize_key_rotation_run');
+    const retire = functionDefinition(sql, 'confirm_previous_key_retirement');
+
+    expect(sql).toContain('CREATE FUNCTION public.key_rotation_inventory(');
+    for (const fn of [finalize, retire]) {
+      expect(fn).toContain('public.lock_key_rotation_account(');
+      expect(fn).toContain('public.key_rotation_inventory(');
+    }
+    expect(finalize).not.toContain("SET status = 'blocked'");
+    expect(finalize).toContain("v_run.status IS DISTINCT FROM 'running'");
+  });
+
+  it('keeps non-apply lifecycle structurally read-only and supports zero inventory', () => {
+    const sql = migration();
+    const rotate = functionDefinition(sql, 'rotate_encrypted_row');
+    const start = functionDefinition(sql, 'start_key_rotation_run');
+    const finalize = functionDefinition(sql, 'finalize_key_rotation_run');
+
+    expect(rotate).toContain("v_run_mode IS DISTINCT FROM 'apply'");
+    expect(start).toContain("v_mode IN ('dry_run', 'final_audit')");
+    expect(finalize).toContain('v_run.expected_items > 0');
+    expect(sql).toContain('zero_inventory');
+  });
+
+  it('exposes secret-safe stuck-run and aggregate monitoring signals', () => {
+    const sql = migration();
+    const active = functionDefinition(sql, 'list_active_key_rotation_runs');
+    const summary = functionDefinition(sql, 'get_key_rotation_audit_summary');
+
+    expect(active).toContain('lifecycle_age_seconds');
+    expect(active).toContain('is_stuck');
+    expect(summary).toContain('error_rate');
+    expect(summary).toContain('waiting_advisory_locks');
+    expect(summary).toContain('pg_catalog.pg_locks');
+    expect(summary).not.toMatch(/plaintext|ciphertext|p_values/i);
+  });
+
+  it('removes unreachable failed states from bounded lifecycle enums', () => {
+    const sql = migration();
+
+    expect(tableDefinition(sql, 'rotation_runs')).not.toMatch(/'failed'/);
+    expect(tableDefinition(sql, 'rotation_items')).not.toMatch(/'failed'/);
   });
 
   it('fails closed for absent or malformed service-role claims', () => {
@@ -343,24 +450,36 @@ describe('046 key rotation database contract — lifecycle and concurrency', () 
     const documentation = readFileSync(contractDocPath, 'utf8');
 
     for (const scenario of [
-      'disable-vs-rotate',
-      'reimport-vs-rotate',
-      'simultaneous-retries',
-      'secret-mutation-vs-rotate',
+      'inventory-vs-insert',
+      'finalize-vs-secret-write',
+      'retire-vs-secret-write',
+      'emergency-disable-vs-rotate',
       'unrelated-jsonb-vs-rotate',
     ]) {
       expect(concurrency).toContain(scenario);
     }
     expect(concurrency).toContain('dblink_send_query');
     expect(concurrency).toContain('dblink_is_busy');
-    expect(documentation).toContain('control → run → item → encrypted row');
+    expect(concurrency).toContain('pg_locks');
+    expect(concurrency).toContain('lock_timeout');
+    expect(concurrency).not.toContain('pg_sleep');
+    expect(documentation).toContain(
+      'control → account barrier → run → item → encrypted row'
+    );
     expect(documentation).toContain('State machine');
+    expect(documentation).toContain('Recovery contract');
   });
 });
 
 describe('database contract CI gate', () => {
   it('applies migrations and executes pgTAP plus concurrency tests locally', () => {
     const yaml = workflow();
+    const pgTap = readFileSync(pgTapTestPath, 'utf8');
+    const concurrency = readFileSync(concurrencyTestPath, 'utf8');
+    const plannedAssertions = [pgTap, concurrency].reduce((total, sql) => {
+      const plan = sql.match(/SELECT plan\((\d+)\)/);
+      return total + Number(plan?.[1] ?? 0);
+    }, 0);
 
     expect(yaml).toContain('name: Database contract (required)');
     expect(yaml).toContain(
@@ -369,7 +488,29 @@ describe('database contract CI gate', () => {
     expect(yaml).toMatch(/version:\s*2\.\d+\.\d+/);
     expect(yaml).toContain('supabase db reset --local --no-seed');
     expect(yaml).toContain('supabase test db --local');
+    expect(plannedAssertions).toBe(114);
     expect(yaml).not.toContain('--linked');
     expect(yaml).toContain('supabase stop --no-backup');
+  });
+
+  it('uses pinned actions and a Supabase 2.45.4-compatible local config', () => {
+    const yaml = workflow();
+    const config = readFileSync(supabaseConfigPath, 'utf8');
+    const actions = [...yaml.matchAll(/uses:\s*([^\s#]+)/g)].map(
+      (match) => match[1]
+    );
+
+    expect(actions.length).toBeGreaterThan(0);
+    for (const action of actions) {
+      expect(action).toMatch(/@[0-9a-f]{40}$/);
+    }
+    expect(config).toContain('[inbucket]');
+    expect(config).not.toContain('[local_smtp]');
+    expect(yaml.indexOf('supabase start')).toBeLessThan(
+      yaml.indexOf('supabase db reset --local --no-seed')
+    );
+    expect(yaml.indexOf('supabase db reset --local --no-seed')).toBeLessThan(
+      yaml.indexOf('supabase test db --local')
+    );
   });
 });

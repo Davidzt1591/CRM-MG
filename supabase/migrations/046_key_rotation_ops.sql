@@ -95,14 +95,61 @@ ALTER TABLE webhook_endpoints
   ADD COLUMN secret_version BIGINT NOT NULL DEFAULT 0,
   ADD COLUMN secret_fingerprint UUID NOT NULL DEFAULT gen_random_uuid();
 
+-- Account-scoped advisory locks are the database write barrier shared by
+-- ordinary application secret writes and rotation lifecycle gates. The hash is
+-- namespaced to this contract; collisions are safe and only reduce concurrency.
+CREATE FUNCTION public.lock_key_rotation_account(p_account_id UUID)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+SET lock_timeout = '5s'
+AS $$
+BEGIN
+  IF p_account_id IS NULL THEN
+    RAISE EXCEPTION 'key rotation account is required' USING ERRCODE = '22023';
+  END IF;
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended('key_rotation:' || p_account_id::TEXT, 0)
+  );
+END;
+$$;
+
+ALTER FUNCTION public.lock_key_rotation_account(UUID)
+  OWNER TO key_rotation_executor;
+REVOKE ALL ON FUNCTION public.lock_key_rotation_account(UUID)
+  FROM PUBLIC, anon, authenticated, service_role;
+
 CREATE FUNCTION public.bump_key_rotation_secret_metadata()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $$
 DECLARE
   encrypted_value_changed BOOLEAN;
 BEGIN
+  IF TG_OP = 'INSERT' THEN
+    encrypted_value_changed := CASE TG_TABLE_NAME
+      WHEN 'whatsapp_config' THEN
+        NEW.access_token IS NOT NULL OR NEW.verify_token IS NOT NULL OR
+        NEW.provider_config ->> 'apiKey' IS NOT NULL OR
+        NEW.provider_config ->> 'secret' IS NOT NULL
+      WHEN 'salesforce_config' THEN
+        NEW.client_id IS NOT NULL OR NEW.client_secret IS NOT NULL OR
+        NEW.username IS NOT NULL OR NEW.password IS NOT NULL OR
+        NEW.security_token IS NOT NULL OR NEW.webhook_secret IS NOT NULL
+      WHEN 'ai_configs' THEN
+        NEW.api_key IS NOT NULL OR NEW.embeddings_api_key IS NOT NULL
+      WHEN 'webhook_endpoints' THEN NEW.secret IS NOT NULL
+      ELSE FALSE
+    END;
+    IF encrypted_value_changed THEN
+      PERFORM public.lock_key_rotation_account(NEW.account_id);
+    END IF;
+    RETURN NEW;
+  END IF;
+
   encrypted_value_changed := CASE TG_TABLE_NAME
     WHEN 'whatsapp_config' THEN
       OLD.access_token IS DISTINCT FROM NEW.access_token OR
@@ -125,6 +172,7 @@ BEGIN
   END;
 
   IF encrypted_value_changed THEN
+    PERFORM public.lock_key_rotation_account(NEW.account_id);
     NEW.secret_version := OLD.secret_version + 1;
     NEW.secret_fingerprint := gen_random_uuid();
   ELSE
@@ -138,17 +186,107 @@ $$;
 ALTER FUNCTION public.bump_key_rotation_secret_metadata() OWNER TO key_rotation_executor;
 
 CREATE TRIGGER whatsapp_config_secret_metadata
-  BEFORE UPDATE ON whatsapp_config
+  BEFORE INSERT OR UPDATE ON whatsapp_config
   FOR EACH ROW EXECUTE FUNCTION public.bump_key_rotation_secret_metadata();
 CREATE TRIGGER salesforce_config_secret_metadata
-  BEFORE UPDATE ON salesforce_config
+  BEFORE INSERT OR UPDATE ON salesforce_config
   FOR EACH ROW EXECUTE FUNCTION public.bump_key_rotation_secret_metadata();
 CREATE TRIGGER ai_configs_secret_metadata
-  BEFORE UPDATE ON ai_configs
+  BEFORE INSERT OR UPDATE ON ai_configs
   FOR EACH ROW EXECUTE FUNCTION public.bump_key_rotation_secret_metadata();
 CREATE TRIGGER webhook_endpoints_secret_metadata
-  BEFORE UPDATE ON webhook_endpoints
+  BEFORE INSERT OR UPDATE ON webhook_endpoints
   FOR EACH ROW EXECUTE FUNCTION public.bump_key_rotation_secret_metadata();
+
+-- One closed, non-dynamic inventory implementation is reused by snapshot and
+-- gate reconciliation so the 13-path policy cannot drift between phases.
+CREATE FUNCTION public.key_rotation_inventory(p_account_id UUID)
+RETURNS TABLE (
+  table_name TEXT,
+  row_id UUID,
+  account_id UUID,
+  target_paths TEXT[],
+  secret_version BIGINT,
+  secret_fingerprint UUID
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+  SELECT *
+  FROM (
+    SELECT
+      'whatsapp_config'::TEXT,
+      config.id,
+      config.account_id,
+      array_remove(ARRAY[
+        CASE WHEN config.access_token IS NOT NULL THEN 'access_token' END,
+        CASE WHEN config.verify_token IS NOT NULL THEN 'verify_token' END,
+        CASE WHEN config.provider_config ->> 'apiKey' IS NOT NULL
+          THEN 'provider_config.apiKey' END,
+        CASE WHEN config.provider_config ->> 'secret' IS NOT NULL
+          THEN 'provider_config.secret' END
+      ]::TEXT[], NULL),
+      config.secret_version,
+      config.secret_fingerprint
+    FROM public.whatsapp_config AS config
+    WHERE config.account_id = p_account_id
+
+    UNION ALL
+
+    SELECT
+      'salesforce_config'::TEXT,
+      config.id,
+      config.account_id,
+      array_remove(ARRAY[
+        CASE WHEN config.client_id IS NOT NULL THEN 'client_id' END,
+        CASE WHEN config.client_secret IS NOT NULL THEN 'client_secret' END,
+        CASE WHEN config.username IS NOT NULL THEN 'username' END,
+        CASE WHEN config.password IS NOT NULL THEN 'password' END,
+        CASE WHEN config.security_token IS NOT NULL THEN 'security_token' END,
+        CASE WHEN config.webhook_secret IS NOT NULL THEN 'webhook_secret' END
+      ]::TEXT[], NULL),
+      config.secret_version,
+      config.secret_fingerprint
+    FROM public.salesforce_config AS config
+    WHERE config.account_id = p_account_id
+
+    UNION ALL
+
+    SELECT
+      'ai_configs'::TEXT,
+      config.id,
+      config.account_id,
+      array_remove(ARRAY[
+        CASE WHEN config.api_key IS NOT NULL THEN 'api_key' END,
+        CASE WHEN config.embeddings_api_key IS NOT NULL
+          THEN 'embeddings_api_key' END
+      ]::TEXT[], NULL),
+      config.secret_version,
+      config.secret_fingerprint
+    FROM public.ai_configs AS config
+    WHERE config.account_id = p_account_id
+
+    UNION ALL
+
+    SELECT
+      'webhook_endpoints'::TEXT,
+      endpoint.id,
+      endpoint.account_id,
+      ARRAY['secret']::TEXT[],
+      endpoint.secret_version,
+      endpoint.secret_fingerprint
+    FROM public.webhook_endpoints AS endpoint
+    WHERE endpoint.account_id = p_account_id AND endpoint.secret IS NOT NULL
+  ) AS inventory
+  WHERE cardinality(inventory.target_paths) > 0;
+$$;
+
+ALTER FUNCTION public.key_rotation_inventory(UUID)
+  OWNER TO key_rotation_executor;
+REVOKE ALL ON FUNCTION public.key_rotation_inventory(UUID)
+  FROM PUBLIC, anon, authenticated, service_role;
 
 CREATE TABLE rotation_runtime_control (
   singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
@@ -176,7 +314,7 @@ CREATE TABLE rotation_runs (
     CONSTRAINT rotation_run_status_check CHECK (
       status IN (
         'planned', 'awaiting_approval', 'approved', 'running', 'completed',
-        'blocked', 'failed', 'retired'
+        'blocked', 'retired'
       )
     ),
   reason_code TEXT NOT NULL DEFAULT 'created'
@@ -186,6 +324,7 @@ CREATE TABLE rotation_runs (
         'approval_required', 'digest_mismatch', 'role_collision',
         'unknown_ownership', 'invalid_payload', 'conflict', 'missing',
         'completed', 'count_mismatch', 'gate_failed', 'retention_active',
+        'inventory_changed', 'zero_inventory',
         'already_purged', 'operator_disabled',
         'incident_response', 'maintenance', 'fix_forward', 'none'
       )
@@ -234,7 +373,7 @@ CREATE TABLE rotation_items (
     CONSTRAINT rotation_item_status_check CHECK (
       status IN (
         'planned', 'validated', 'approved', 'applied', 'conflict',
-        'missing', 'failed', 'blocked'
+        'missing', 'blocked'
       )
     ),
   reason_code TEXT NOT NULL DEFAULT 'none'
@@ -243,7 +382,7 @@ CREATE TABLE rotation_items (
         'none', 'applied', 'already_applied', 'version_conflict',
         'row_missing', 'invalid_payload', 'approval_required',
         'unknown_ownership', 'digest_mismatch', 'role_collision',
-        'operations_disabled', 'payload_mismatch'
+        'operations_disabled', 'payload_mismatch', 'mode_read_only'
       )
     ),
   attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
@@ -322,7 +461,7 @@ CREATE TABLE rotation_audit_events (
     CONSTRAINT rotation_audit_event_type_check CHECK (
       event_type IN (
         'operations_enabled', 'operations_disabled', 'run_created', 'run_started',
-        'manifest_imported', 'manifest_approved', 'manifest_rejected',
+        'manifest_imported', 'manifest_replayed', 'manifest_approved', 'manifest_rejected',
         'item_applied', 'item_replayed', 'item_conflict', 'item_missing',
         'item_rejected', 'run_completed', 'gate_failed', 'key_retired',
         'manifest_purged'
@@ -336,11 +475,12 @@ CREATE TABLE rotation_audit_events (
     CONSTRAINT rotation_audit_reason_check CHECK (
       reason_code IN (
         'none', 'created', 'started', 'applied', 'already_applied',
-        'manifest_pending', 'manifest_reimported',
+        'manifest_pending', 'manifest_reimported', 'manifest_replayed',
         'version_conflict', 'row_missing', 'invalid_payload',
         'approval_required', 'unknown_ownership', 'digest_mismatch',
         'role_collision', 'operations_disabled', 'payload_mismatch',
-        'count_mismatch', 'already_purged', 'operator_disabled',
+        'count_mismatch', 'inventory_changed', 'zero_inventory',
+        'already_purged', 'operator_disabled', 'mode_read_only',
         'incident_response', 'maintenance', 'fix_forward', 'completed',
         'gate_failed', 'retention_active'
       )
@@ -390,7 +530,7 @@ GRANT SELECT, UPDATE ON whatsapp_config, salesforce_config, ai_configs,
 GRANT SELECT ON profiles TO key_rotation_executor;
 
 -- Every state-changing operation follows the same deadlock-safe order:
--- LOCK ORDER: control -> run -> item -> encrypted row.
+-- LOCK ORDER: control -> account barrier -> run -> item -> encrypted row.
 -- Locks are transaction-scoped and every caller re-reads state after acquiring
 -- them. Private helpers are not executable by API roles.
 CREATE FUNCTION public.lock_key_rotation_control()
@@ -444,14 +584,14 @@ BEGIN
   FROM (
     SELECT
       COUNT(*) FILTER (WHERE item.attempts > 0)::BIGINT AS visited_items,
-      COUNT(*) FILTER (
-        WHERE item.status IN ('applied', 'conflict', 'missing', 'failed', 'blocked')
+       COUNT(*) FILTER (
+        WHERE item.status IN ('applied', 'conflict', 'missing', 'blocked')
       )::BIGINT AS terminal_items,
       COALESCE(SUM(cardinality(item.target_paths)) FILTER (
         WHERE item.status = 'applied'
       ), 0)::BIGINT AS applied_values,
       COALESCE(SUM(cardinality(item.target_paths)) FILTER (
-        WHERE item.status IN ('conflict', 'missing', 'failed', 'blocked')
+        WHERE item.status IN ('conflict', 'missing', 'blocked')
       ), 0)::BIGINT AS failed_values
     FROM public.rotation_items AS item
     WHERE item.run_id = p_run_id
@@ -665,42 +805,44 @@ CREATE FUNCTION public.rotation_item_matches_applied_metadata(
 )
 RETURNS BOOLEAN
 LANGUAGE plpgsql
-STABLE
 SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $$
+DECLARE
+  v_matches BOOLEAN := FALSE;
 BEGIN
-  RETURN CASE p_item.table_name
-    WHEN 'whatsapp_config' THEN EXISTS (
-      SELECT 1 FROM public.whatsapp_config AS encrypted_row
+  CASE p_item.table_name
+    WHEN 'whatsapp_config' THEN
+      SELECT TRUE INTO v_matches FROM public.whatsapp_config AS encrypted_row
       WHERE encrypted_row.id = p_item.row_id
         AND encrypted_row.account_id = p_item.account_id
         AND encrypted_row.secret_version = p_item.applied_version
         AND encrypted_row.secret_fingerprint = p_item.applied_fingerprint
-    )
-    WHEN 'salesforce_config' THEN EXISTS (
-      SELECT 1 FROM public.salesforce_config AS encrypted_row
+      FOR UPDATE;
+    WHEN 'salesforce_config' THEN
+      SELECT TRUE INTO v_matches FROM public.salesforce_config AS encrypted_row
       WHERE encrypted_row.id = p_item.row_id
         AND encrypted_row.account_id = p_item.account_id
         AND encrypted_row.secret_version = p_item.applied_version
         AND encrypted_row.secret_fingerprint = p_item.applied_fingerprint
-    )
-    WHEN 'ai_configs' THEN EXISTS (
-      SELECT 1 FROM public.ai_configs AS encrypted_row
+      FOR UPDATE;
+    WHEN 'ai_configs' THEN
+      SELECT TRUE INTO v_matches FROM public.ai_configs AS encrypted_row
       WHERE encrypted_row.id = p_item.row_id
         AND encrypted_row.account_id = p_item.account_id
         AND encrypted_row.secret_version = p_item.applied_version
         AND encrypted_row.secret_fingerprint = p_item.applied_fingerprint
-    )
-    WHEN 'webhook_endpoints' THEN EXISTS (
-      SELECT 1 FROM public.webhook_endpoints AS encrypted_row
+      FOR UPDATE;
+    WHEN 'webhook_endpoints' THEN
+      SELECT TRUE INTO v_matches FROM public.webhook_endpoints AS encrypted_row
       WHERE encrypted_row.id = p_item.row_id
         AND encrypted_row.account_id = p_item.account_id
         AND encrypted_row.secret_version = p_item.applied_version
         AND encrypted_row.secret_fingerprint = p_item.applied_fingerprint
-    )
-    ELSE FALSE
-  END;
+      FOR UPDATE;
+    ELSE v_matches := FALSE;
+  END CASE;
+  RETURN COALESCE(v_matches, FALSE);
 END;
 $$;
 
@@ -778,6 +920,7 @@ AS $$
 DECLARE
   v_operations_enabled BOOLEAN;
   v_run_status TEXT;
+  v_run_mode TEXT;
   v_item_status TEXT;
   v_item_table TEXT;
   v_item_row_id UUID;
@@ -792,12 +935,24 @@ DECLARE
   v_new_fingerprint UUID;
   v_payload_digest BYTEA;
   v_row_exists BOOLEAN := FALSE;
+  v_max_ciphertext_bytes CONSTANT INTEGER := 16 * 1024;
 BEGIN
   IF auth.role() IS DISTINCT FROM 'service_role' THEN
     RAISE EXCEPTION 'key rotation authorization failed' USING ERRCODE = '42501';
   END IF;
 
   PERFORM public.lock_key_rotation_control();
+  SELECT run.account_id
+  INTO v_run_account_id
+  FROM public.rotation_runs AS run
+  WHERE run.id = p_run_id;
+  IF NOT FOUND THEN
+    RETURN QUERY SELECT
+      'rejected'::TEXT, NULL::UUID, NULL::BIGINT, NULL::UUID,
+      'invalid_payload'::TEXT;
+    RETURN;
+  END IF;
+  PERFORM public.lock_key_rotation_account(v_run_account_id);
   IF NOT public.lock_key_rotation_run(p_run_id) THEN
     RETURN QUERY SELECT
       'rejected'::TEXT, NULL::UUID, NULL::BIGINT, NULL::UUID,
@@ -805,8 +960,8 @@ BEGIN
     RETURN;
   END IF;
 
-  SELECT run.status, run.account_id
-  INTO v_run_status, v_run_account_id
+  SELECT run.status, run.mode, run.account_id
+  INTO v_run_status, v_run_mode, v_run_account_id
   FROM public.rotation_runs AS run
   WHERE run.id = p_run_id;
 
@@ -857,6 +1012,26 @@ BEGIN
     RETURN;
   END IF;
 
+  IF v_run_mode IS DISTINCT FROM 'apply' THEN
+    PERFORM public.reject_key_rotation_item(
+      p_run_id, p_item_id, v_account_id, 'mode_read_only'
+    );
+    RETURN QUERY SELECT
+      'rejected'::TEXT, v_account_id, NULL::BIGINT, NULL::UUID,
+      'mode_read_only'::TEXT;
+    RETURN;
+  END IF;
+
+  IF v_run_status IS DISTINCT FROM 'running' THEN
+    PERFORM public.reject_key_rotation_item(
+      p_run_id, p_item_id, v_account_id, 'approval_required'
+    );
+    RETURN QUERY SELECT
+      'rejected'::TEXT, v_account_id, NULL::BIGINT, NULL::UUID,
+      'approval_required'::TEXT;
+    RETURN;
+  END IF;
+
   v_payload_digest := extensions.digest(
     convert_to(p_values::TEXT, 'UTF8'),
     'sha256'
@@ -876,6 +1051,22 @@ BEGIN
         NULL::BIGINT,
         NULL::UUID,
         'payload_mismatch'::TEXT;
+      RETURN;
+    END IF;
+
+    IF NOT public.rotation_item_matches_applied_metadata(
+      (SELECT item FROM public.rotation_items AS item
+       WHERE item.run_id = p_run_id AND item.id = p_item_id)
+    ) THEN
+      INSERT INTO public.rotation_audit_events (
+        run_id, item_id, account_id, actor_id, event_type, status, reason_code
+      ) VALUES (
+        p_run_id, p_item_id, v_account_id, auth.uid(),
+        'item_conflict', 'blocked', 'version_conflict'
+      );
+      RETURN QUERY SELECT
+        'conflict'::TEXT, v_account_id, NULL::BIGINT, NULL::UUID,
+        'version_conflict'::TEXT;
       RETURN;
     END IF;
 
@@ -904,16 +1095,6 @@ BEGIN
     RETURN QUERY SELECT
       'rejected'::TEXT, v_account_id, NULL::BIGINT, NULL::UUID,
       'operations_disabled'::TEXT;
-    RETURN;
-  END IF;
-
-  IF v_run_status <> 'running' THEN
-    PERFORM public.reject_key_rotation_item(
-      p_run_id, p_item_id, v_account_id, 'approval_required'
-    );
-    RETURN QUERY SELECT
-      'rejected'::TEXT, v_account_id, NULL::BIGINT, NULL::UUID,
-      'approval_required'::TEXT;
     RETURN;
   END IF;
 
@@ -958,7 +1139,7 @@ BEGIN
     SELECT 1
     FROM jsonb_each(p_values) AS values_to_validate(path, encoded_value)
     WHERE jsonb_typeof(encoded_value) <> 'string'
-       OR octet_length(encoded_value #>> '{}') > 16384
+       OR octet_length(encoded_value #>> '{}') > v_max_ciphertext_bytes
        OR encoded_value #>> '{}' !~ '^[0-9a-f]{24}:[0-9a-f]*:[0-9a-f]{32}$'
   ) THEN
     PERFORM public.reject_key_rotation_item(
@@ -1183,6 +1364,9 @@ DECLARE
   v_canonical_entries JSONB;
   v_computed_digest BYTEA;
   v_submitted_digest BYTEA;
+  v_existing_manifest_id UUID;
+  v_existing_revision INTEGER;
+  v_existing_status TEXT;
 BEGIN
   IF auth.role() IS DISTINCT FROM 'authenticated' OR v_preparer_id IS NULL THEN
     RAISE EXCEPTION 'manifest authorization failed' USING ERRCODE = '42501';
@@ -1289,6 +1473,31 @@ BEGIN
     RAISE EXCEPTION 'manifest digest mismatch' USING ERRCODE = '22000';
   END IF;
 
+  SELECT manifest.id, manifest.revision, run.status
+  INTO v_existing_manifest_id, v_existing_revision, v_existing_status
+  FROM public.rotation_manifests AS manifest
+  JOIN public.rotation_runs AS run ON run.id = manifest.run_id
+  WHERE manifest.run_id = p_run_id
+    AND manifest.manifest_digest = v_computed_digest
+  ORDER BY manifest.revision DESC
+  LIMIT 1;
+
+  IF v_existing_manifest_id IS NOT NULL THEN
+    INSERT INTO public.rotation_audit_events (
+      run_id, account_id, actor_id, event_type, status, reason_code
+    ) VALUES (
+      p_run_id, v_run_account_id, v_preparer_id, 'manifest_replayed',
+      'accepted', 'manifest_replayed'
+    );
+    RETURN QUERY SELECT
+      v_existing_manifest_id,
+      v_existing_revision,
+      encode(v_computed_digest, 'hex'),
+      v_existing_status,
+      'manifest_replayed'::TEXT;
+    RETURN;
+  END IF;
+
   SELECT COUNT(*), COALESCE(MAX(m.revision), 0) + 1
   INTO v_prior_revisions, v_revision
   FROM public.rotation_manifests m
@@ -1366,6 +1575,7 @@ DECLARE
   v_run_account_id UUID;
   v_run_status TEXT;
   v_stored_digest BYTEA;
+  v_existing_decision TEXT;
 BEGIN
   IF auth.role() IS DISTINCT FROM 'authenticated' OR v_approver_id IS NULL THEN
     RAISE EXCEPTION 'manifest authorization failed' USING ERRCODE = '42501';
@@ -1427,6 +1637,19 @@ BEGIN
     SELECT 1 FROM public.rotation_manifest_approvals
     WHERE rotation_manifest_approvals.manifest_id = v_manifest_id
   ) THEN
+    SELECT decision INTO v_existing_decision
+    FROM public.rotation_manifest_approvals
+    WHERE rotation_manifest_approvals.manifest_id = v_manifest_id;
+    INSERT INTO public.rotation_audit_events (
+      run_id, account_id, actor_id, event_type, status, reason_code
+    ) VALUES (
+      p_run_id, v_run_account_id, v_approver_id,
+      CASE WHEN v_existing_decision = 'approved'
+        THEN 'manifest_approved' ELSE 'manifest_rejected' END,
+      CASE WHEN v_existing_decision = 'approved' THEN 'accepted' ELSE 'blocked' END,
+      CASE WHEN v_existing_decision = 'approved' THEN 'none'
+        ELSE 'approval_required' END
+    );
     RETURN QUERY SELECT
       'already_recorded'::TEXT, 'none'::TEXT, v_manifest_id;
     RETURN;
@@ -1550,6 +1773,7 @@ BEGIN
   END IF;
 
   PERFORM public.lock_key_rotation_control();
+  PERFORM public.lock_key_rotation_account(p_account_id);
 
   INSERT INTO public.rotation_runs (
     account_id, mode, current_key_fingerprint, previous_key_fingerprint,
@@ -1560,79 +1784,13 @@ BEGIN
   )
   RETURNING id INTO v_run_id;
 
-  WITH inventory AS (
-    SELECT
-      'whatsapp_config'::TEXT AS table_name,
-      config.id AS row_id,
-      config.account_id,
-      array_remove(ARRAY[
-        CASE WHEN config.access_token IS NOT NULL THEN 'access_token' END,
-        CASE WHEN config.verify_token IS NOT NULL THEN 'verify_token' END,
-        CASE WHEN config.provider_config ->> 'apiKey' IS NOT NULL
-          THEN 'provider_config.apiKey' END,
-        CASE WHEN config.provider_config ->> 'secret' IS NOT NULL
-          THEN 'provider_config.secret' END
-      ]::TEXT[], NULL) AS target_paths,
-      config.secret_version AS expected_version,
-      config.secret_fingerprint AS expected_fingerprint
-    FROM public.whatsapp_config AS config
-    WHERE config.account_id = p_account_id
-
-    UNION ALL
-
-    SELECT
-      'salesforce_config'::TEXT,
-      config.id,
-      config.account_id,
-      array_remove(ARRAY[
-        CASE WHEN config.client_id IS NOT NULL THEN 'client_id' END,
-        CASE WHEN config.client_secret IS NOT NULL THEN 'client_secret' END,
-        CASE WHEN config.username IS NOT NULL THEN 'username' END,
-        CASE WHEN config.password IS NOT NULL THEN 'password' END,
-        CASE WHEN config.security_token IS NOT NULL THEN 'security_token' END,
-        CASE WHEN config.webhook_secret IS NOT NULL THEN 'webhook_secret' END
-      ]::TEXT[], NULL),
-      config.secret_version,
-      config.secret_fingerprint
-    FROM public.salesforce_config AS config
-    WHERE config.account_id = p_account_id
-
-    UNION ALL
-
-    SELECT
-      'ai_configs'::TEXT,
-      config.id,
-      config.account_id,
-      array_remove(ARRAY[
-        CASE WHEN config.api_key IS NOT NULL THEN 'api_key' END,
-        CASE WHEN config.embeddings_api_key IS NOT NULL
-          THEN 'embeddings_api_key' END
-      ]::TEXT[], NULL),
-      config.secret_version,
-      config.secret_fingerprint
-    FROM public.ai_configs AS config
-    WHERE config.account_id = p_account_id
-
-    UNION ALL
-
-    SELECT
-      'webhook_endpoints'::TEXT,
-      endpoint.id,
-      endpoint.account_id,
-      ARRAY['secret']::TEXT[],
-      endpoint.secret_version,
-      endpoint.secret_fingerprint
-    FROM public.webhook_endpoints AS endpoint
-    WHERE endpoint.account_id = p_account_id
-      AND endpoint.secret IS NOT NULL
-  ), numbered AS (
+  WITH numbered AS (
     SELECT
       inventory.*,
       row_number() OVER (
         ORDER BY inventory.table_name, inventory.row_id
       )::BIGINT AS sequence
-    FROM inventory
-    WHERE cardinality(inventory.target_paths) > 0
+    FROM public.key_rotation_inventory(p_account_id) AS inventory
   )
   INSERT INTO public.rotation_items (
     run_id, sequence, account_id, table_name, row_id, target_paths,
@@ -1640,8 +1798,8 @@ BEGIN
   )
   SELECT
     v_run_id, numbered.sequence, numbered.account_id, numbered.table_name,
-    numbered.row_id, numbered.target_paths, numbered.expected_version,
-    numbered.expected_fingerprint
+    numbered.row_id, numbered.target_paths, numbered.secret_version,
+    numbered.secret_fingerprint
   FROM numbered;
 
   GET DIAGNOSTICS v_expected_items = ROW_COUNT;
@@ -1668,6 +1826,8 @@ AS $$
 DECLARE
   v_enabled BOOLEAN;
   v_status TEXT;
+  v_mode TEXT;
+  v_expected_items BIGINT;
   v_account_id UUID;
 BEGIN
   IF auth.role() IS DISTINCT FROM 'service_role' THEN
@@ -1684,16 +1844,21 @@ BEGIN
   INTO v_enabled
   FROM public.rotation_runtime_control AS control
   WHERE control.singleton;
-  SELECT run.status, run.account_id
-  INTO v_status, v_account_id
+  SELECT run.status, run.mode, run.expected_items, run.account_id
+  INTO v_status, v_mode, v_expected_items, v_account_id
   FROM public.rotation_runs AS run
   WHERE run.id = p_run_id;
 
   IF v_status = 'running' THEN
+    INSERT INTO public.rotation_audit_events (
+      run_id, account_id, actor_id, event_type, status, reason_code
+    ) VALUES (
+      p_run_id, v_account_id, auth.uid(), 'run_started', 'accepted', 'started'
+    );
     RETURN QUERY SELECT 'already_started'::TEXT, 'none'::TEXT;
     RETURN;
   END IF;
-  IF NOT COALESCE(v_enabled, FALSE) THEN
+  IF v_mode = 'apply' AND NOT COALESCE(v_enabled, FALSE) THEN
     INSERT INTO public.rotation_audit_events (
       run_id, account_id, actor_id, event_type, status, reason_code
     ) VALUES (
@@ -1703,7 +1868,12 @@ BEGIN
     RETURN QUERY SELECT 'rejected'::TEXT, 'operations_disabled'::TEXT;
     RETURN;
   END IF;
-  IF v_status <> 'approved' OR NOT EXISTS (
+  IF v_mode = 'dry_run' AND v_status = 'planned' THEN
+    NULL;
+  ELSIF v_mode IN ('dry_run', 'final_audit') AND
+        v_expected_items = 0 AND v_status = 'planned' THEN
+    NULL;
+  ELSIF v_status <> 'approved' OR NOT EXISTS (
     SELECT 1
     FROM public.rotation_manifests AS manifest
     JOIN public.rotation_manifest_approvals AS approval
@@ -1728,12 +1898,16 @@ BEGIN
   END IF;
 
   UPDATE public.rotation_runs
-  SET status = 'running', reason_code = 'started', started_at = now()
+  SET status = 'running',
+      reason_code = CASE WHEN v_expected_items = 0
+        THEN 'zero_inventory' ELSE 'started' END,
+      started_at = COALESCE(started_at, now())
   WHERE id = p_run_id;
   INSERT INTO public.rotation_audit_events (
     run_id, account_id, actor_id, event_type, status, reason_code
   ) VALUES (
-    p_run_id, v_account_id, auth.uid(), 'run_started', 'accepted', 'started'
+    p_run_id, v_account_id, auth.uid(), 'run_started', 'accepted',
+    CASE WHEN v_expected_items = 0 THEN 'zero_inventory' ELSE 'started' END
   );
   RETURN QUERY SELECT 'started'::TEXT, 'none'::TEXT;
 END;
@@ -1748,12 +1922,21 @@ AS $$
 DECLARE
   v_run public.rotation_runs%ROWTYPE;
   v_value_count BIGINT;
+  v_inventory_count BIGINT;
+  v_manifest_id UUID;
 BEGIN
   IF auth.role() IS DISTINCT FROM 'service_role' THEN
     RAISE EXCEPTION 'key rotation authorization failed' USING ERRCODE = '42501';
   END IF;
 
   PERFORM public.lock_key_rotation_control();
+  SELECT run.account_id INTO v_run.account_id
+  FROM public.rotation_runs AS run WHERE run.id = p_run_id;
+  IF NOT FOUND THEN
+    RETURN QUERY SELECT 'rejected'::TEXT, 'invalid_payload'::TEXT;
+    RETURN;
+  END IF;
+  PERFORM public.lock_key_rotation_account(v_run.account_id);
   IF NOT public.lock_key_rotation_run(p_run_id) THEN
     RETURN QUERY SELECT 'rejected'::TEXT, 'invalid_payload'::TEXT;
     RETURN;
@@ -1765,37 +1948,67 @@ BEGIN
   WHERE id = p_run_id;
 
   IF v_run.status = 'completed' THEN
+    INSERT INTO public.rotation_audit_events (
+      run_id, account_id, actor_id, event_type, status, reason_code
+    ) VALUES (
+      p_run_id, v_run.account_id, auth.uid(), 'run_completed', 'accepted',
+      'completed'
+    );
     RETURN QUERY SELECT 'already_completed'::TEXT, 'none'::TEXT;
     RETURN;
   END IF;
-  IF v_run.status <> 'running' OR
-     v_run.expected_items <> v_run.visited_items OR
-     v_run.expected_items <> v_run.terminal_items OR
-     NOT EXISTS (
-       SELECT 1
-       FROM public.rotation_manifests AS manifest
-       JOIN public.rotation_manifest_approvals AS approval
-         ON approval.manifest_id = manifest.id
-        AND approval.manifest_digest = manifest.manifest_digest
-        AND approval.decision = 'approved'
-       WHERE manifest.run_id = p_run_id
-         AND manifest.revision = (
-           SELECT MAX(latest.revision)
-           FROM public.rotation_manifests AS latest
-           WHERE latest.run_id = p_run_id
-         )
-     ) OR
+
+  IF v_run.status IS DISTINCT FROM 'running' THEN
+    INSERT INTO public.rotation_audit_events (
+      run_id, account_id, actor_id, event_type, status, reason_code
+    ) VALUES (
+      p_run_id, v_run.account_id, auth.uid(), 'gate_failed', 'blocked',
+      'count_mismatch'
+    );
+    RETURN QUERY SELECT 'blocked'::TEXT, 'count_mismatch'::TEXT;
+    RETURN;
+  END IF;
+
+  SELECT COUNT(*)::BIGINT INTO v_inventory_count
+  FROM public.key_rotation_inventory(v_run.account_id);
+
+  -- Snapshot and actual inventory must be identical under the account barrier.
+  IF v_inventory_count IS DISTINCT FROM v_run.expected_items OR
      EXISTS (
-       SELECT 1 FROM public.rotation_items AS item
-       WHERE item.run_id = p_run_id
-         AND (
-           item.status <> 'applied' OR
-           item.replacement_payload_digest IS NULL OR
-           NOT public.rotation_item_matches_applied_metadata(item)
-         )
+       SELECT 1
+       FROM public.key_rotation_inventory(v_run.account_id) AS actual
+       FULL JOIN (
+         SELECT * FROM public.rotation_items WHERE run_id = p_run_id
+       ) AS item
+         ON item.table_name = actual.table_name
+        AND item.row_id = actual.row_id
+       WHERE item.id IS NULL OR actual.row_id IS NULL OR
+         item.target_paths IS DISTINCT FROM actual.target_paths
      ) THEN
-    UPDATE public.rotation_runs
-    SET status = 'blocked', reason_code = 'count_mismatch'
+    UPDATE public.rotation_runs SET reason_code = 'inventory_changed'
+    WHERE id = p_run_id;
+    INSERT INTO public.rotation_audit_events (
+      run_id, account_id, actor_id, event_type, status, reason_code
+    ) VALUES (
+      p_run_id, v_run.account_id, auth.uid(), 'gate_failed', 'blocked',
+      'inventory_changed'
+    );
+    RETURN QUERY SELECT 'blocked'::TEXT, 'inventory_changed'::TEXT;
+    RETURN;
+  END IF;
+
+  IF v_run.mode = 'apply' AND (
+    v_run.expected_items <> v_run.visited_items OR
+    v_run.expected_items <> v_run.terminal_items OR
+    EXISTS (
+      SELECT 1 FROM public.rotation_items AS item
+      WHERE item.run_id = p_run_id AND (
+        item.status <> 'applied' OR item.replacement_payload_digest IS NULL OR
+        NOT public.rotation_item_matches_applied_metadata(item)
+      )
+    )
+  ) THEN
+    UPDATE public.rotation_runs SET reason_code = 'count_mismatch'
     WHERE id = p_run_id;
     INSERT INTO public.rotation_audit_events (
       run_id, account_id, actor_id, event_type, status, reason_code
@@ -1805,6 +2018,77 @@ BEGIN
     );
     RETURN QUERY SELECT 'blocked'::TEXT, 'count_mismatch'::TEXT;
     RETURN;
+  END IF;
+
+  IF v_run.mode IN ('dry_run', 'final_audit') AND EXISTS (
+    SELECT 1
+    FROM public.rotation_items AS item
+    JOIN public.key_rotation_inventory(v_run.account_id) AS actual
+      ON actual.table_name = item.table_name AND actual.row_id = item.row_id
+    WHERE item.run_id = p_run_id AND (
+      item.expected_version IS DISTINCT FROM actual.secret_version OR
+      item.expected_fingerprint IS DISTINCT FROM actual.secret_fingerprint
+    )
+  ) THEN
+    UPDATE public.rotation_runs SET reason_code = 'inventory_changed'
+    WHERE id = p_run_id;
+    INSERT INTO public.rotation_audit_events (
+      run_id, account_id, actor_id, event_type, status, reason_code
+    ) VALUES (
+      p_run_id, v_run.account_id, auth.uid(), 'gate_failed', 'blocked',
+      'inventory_changed'
+    );
+    RETURN QUERY SELECT 'blocked'::TEXT, 'inventory_changed'::TEXT;
+    RETURN;
+  END IF;
+
+  IF v_run.mode = 'final_audit' AND v_run.expected_items > 0 THEN
+    SELECT manifest.id INTO v_manifest_id
+    FROM public.rotation_manifests AS manifest
+    JOIN public.rotation_manifest_approvals AS approval
+      ON approval.manifest_id = manifest.id
+     AND approval.manifest_digest = manifest.manifest_digest
+     AND approval.decision = 'approved'
+    WHERE manifest.run_id = p_run_id
+    ORDER BY manifest.revision DESC
+    LIMIT 1;
+
+    IF v_manifest_id IS NULL OR EXISTS (
+      SELECT 1
+      FROM public.rotation_manifest_entries AS entry
+      WHERE entry.manifest_id = v_manifest_id AND (
+        entry.value_format <> 'gcm' OR entry.legacy_owner <> 'current' OR
+        NOT public.rotation_manifest_entry_digest_matches(entry)
+      )
+    ) OR (
+      SELECT COUNT(*) FROM public.rotation_manifest_entries AS entry
+      WHERE entry.manifest_id = v_manifest_id
+    ) IS DISTINCT FROM (
+      SELECT COALESCE(SUM(cardinality(actual.target_paths)), 0)
+      FROM public.key_rotation_inventory(v_run.account_id) AS actual
+    ) THEN
+      UPDATE public.rotation_runs SET reason_code = 'gate_failed'
+      WHERE id = p_run_id;
+      INSERT INTO public.rotation_audit_events (
+        run_id, account_id, actor_id, event_type, status, reason_code
+      ) VALUES (
+        p_run_id, v_run.account_id, auth.uid(), 'gate_failed', 'blocked',
+        'gate_failed'
+      );
+      RETURN QUERY SELECT 'blocked'::TEXT, 'gate_failed'::TEXT;
+      RETURN;
+    END IF;
+  END IF;
+
+  IF v_run.mode IN ('dry_run', 'final_audit') THEN
+    UPDATE public.rotation_items
+    SET status = 'validated', reason_code = 'none', attempts = 1,
+        first_attempted_at = COALESCE(first_attempted_at, now()),
+        terminal_at = now()
+    WHERE run_id = p_run_id;
+    UPDATE public.rotation_runs
+    SET visited_items = expected_items, terminal_items = expected_items
+    WHERE id = p_run_id;
   END IF;
 
   SELECT COALESCE(SUM(cardinality(item.target_paths)), 0)::BIGINT
@@ -1845,12 +2129,23 @@ AS $$
 DECLARE
   v_enabled BOOLEAN;
   v_run public.rotation_runs%ROWTYPE;
+  v_inventory_count BIGINT;
+  v_manifest_id UUID;
 BEGIN
   IF auth.role() IS DISTINCT FROM 'service_role' THEN
     RAISE EXCEPTION 'key rotation authorization failed' USING ERRCODE = '42501';
   END IF;
 
   PERFORM public.lock_key_rotation_control();
+  SELECT run.account_id INTO v_run.account_id
+  FROM public.rotation_runs AS run WHERE run.id = p_run_id;
+  IF NOT FOUND THEN
+    RETURN QUERY SELECT
+      'rejected'::TEXT, NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ,
+      'invalid_payload'::TEXT;
+    RETURN;
+  END IF;
+  PERFORM public.lock_key_rotation_account(v_run.account_id);
   IF NOT public.lock_key_rotation_run(p_run_id) THEN
     RETURN QUERY SELECT
       'rejected'::TEXT, NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ,
@@ -1862,18 +2157,61 @@ BEGIN
   SELECT * INTO v_run FROM public.rotation_runs WHERE id = p_run_id;
 
   IF v_run.previous_key_retired_at IS NOT NULL THEN
+    INSERT INTO public.rotation_audit_events (
+      run_id, account_id, actor_id, event_type, status, reason_code
+    ) VALUES (
+      p_run_id, v_run.account_id, auth.uid(), 'key_retired', 'accepted', 'none'
+    );
     RETURN QUERY SELECT
       'already_retired'::TEXT, v_run.previous_key_retired_at,
       v_run.purge_after, 'none'::TEXT;
     RETURN;
   END IF;
+
+  SELECT COUNT(*)::BIGINT INTO v_inventory_count
+  FROM public.key_rotation_inventory(v_run.account_id);
+  SELECT manifest.id INTO v_manifest_id
+  FROM public.rotation_manifests AS manifest
+  JOIN public.rotation_manifest_approvals AS approval
+    ON approval.manifest_id = manifest.id
+   AND approval.manifest_digest = manifest.manifest_digest
+   AND approval.decision = 'approved'
+  WHERE manifest.run_id = p_run_id
+  ORDER BY manifest.revision DESC
+  LIMIT 1;
+
   IF COALESCE(v_enabled, FALSE) OR
      v_run.mode <> 'final_audit' OR
      v_run.status <> 'completed' OR
+     v_inventory_count IS DISTINCT FROM v_run.expected_items OR
+     EXISTS (
+       SELECT 1
+       FROM public.key_rotation_inventory(v_run.account_id) AS actual
+       FULL JOIN (
+         SELECT * FROM public.rotation_items WHERE run_id = p_run_id
+       ) AS item
+         ON item.table_name = actual.table_name
+        AND item.row_id = actual.row_id
+       WHERE item.id IS NULL OR actual.row_id IS NULL OR
+         item.target_paths IS DISTINCT FROM actual.target_paths OR
+         item.expected_version IS DISTINCT FROM actual.secret_version OR
+         item.expected_fingerprint IS DISTINCT FROM actual.secret_fingerprint
+     ) OR
+     (v_run.expected_items > 0 AND (
+       v_manifest_id IS NULL OR EXISTS (
+         SELECT 1 FROM public.rotation_manifest_entries AS entry
+         WHERE entry.manifest_id = v_manifest_id AND (
+           entry.value_format <> 'gcm' OR entry.legacy_owner <> 'current' OR
+           NOT public.rotation_manifest_entry_digest_matches(entry)
+         )
+       )
+     )) OR
      v_run.expected_items <> v_run.terminal_items OR
      v_run.failed_values <> 0 OR
      v_run.previous_values <> 0 OR
      v_run.unknown_values <> 0 THEN
+    UPDATE public.rotation_runs SET reason_code = 'gate_failed'
+    WHERE id = p_run_id;
     INSERT INTO public.rotation_audit_events (
       run_id, account_id, actor_id, event_type, status, reason_code
     ) VALUES (
@@ -1932,6 +2270,12 @@ BEGIN
   IF NOT EXISTS (
     SELECT 1 FROM public.rotation_manifests WHERE run_id = p_run_id
   ) THEN
+    INSERT INTO public.rotation_audit_events (
+      run_id, account_id, actor_id, event_type, status, reason_code
+    ) VALUES (
+      p_run_id, v_run.account_id, auth.uid(), 'manifest_purged', 'accepted',
+      'already_purged'
+    );
     RETURN QUERY SELECT 'already_purged'::TEXT, 'already_purged'::TEXT;
     RETURN;
   END IF;
@@ -2007,6 +2351,105 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION public.list_active_key_rotation_runs(
+  p_stuck_after INTERVAL DEFAULT INTERVAL '15 minutes'
+)
+RETURNS TABLE (
+  run_id UUID,
+  account_id UUID,
+  mode TEXT,
+  status TEXT,
+  reason_code TEXT,
+  lifecycle_age_seconds BIGINT,
+  is_stuck BOOLEAN,
+  expected_items BIGINT,
+  terminal_items BIGINT,
+  error_count BIGINT
+)
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+  IF auth.role() IS DISTINCT FROM 'service_role' THEN
+    RAISE EXCEPTION 'key rotation authorization failed' USING ERRCODE = '42501';
+  END IF;
+  IF p_stuck_after <= INTERVAL '0 seconds' THEN
+    RAISE EXCEPTION 'stuck threshold must be positive' USING ERRCODE = '22023';
+  END IF;
+
+  RETURN QUERY
+  SELECT
+    run.id,
+    run.account_id,
+    run.mode,
+    run.status,
+    run.reason_code,
+    EXTRACT(EPOCH FROM (now() - COALESCE(run.started_at, run.created_at)))::BIGINT,
+    now() - COALESCE(run.started_at, run.created_at) >= p_stuck_after,
+    run.expected_items,
+    run.terminal_items,
+    run.failed_values
+  FROM public.rotation_runs AS run
+  WHERE run.status IN (
+    'planned', 'awaiting_approval', 'approved', 'running', 'blocked'
+  )
+  ORDER BY run.created_at;
+END;
+$$;
+
+CREATE FUNCTION public.get_key_rotation_audit_summary(p_run_id UUID)
+RETURNS TABLE (
+  run_id UUID,
+  total_events BIGINT,
+  error_events BIGINT,
+  error_rate NUMERIC,
+  lifecycle_age_seconds BIGINT,
+  last_event_at TIMESTAMPTZ,
+  waiting_advisory_locks BIGINT
+)
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+  IF auth.role() IS DISTINCT FROM 'service_role' THEN
+    RAISE EXCEPTION 'key rotation authorization failed' USING ERRCODE = '42501';
+  END IF;
+
+  RETURN QUERY
+  SELECT
+    run.id,
+    COUNT(event.id)::BIGINT,
+    COUNT(event.id) FILTER (
+      WHERE event.status IN ('blocked', 'failed')
+    )::BIGINT,
+    CASE WHEN COUNT(event.id) = 0 THEN 0::NUMERIC ELSE
+      ROUND(
+        COUNT(event.id) FILTER (
+          WHERE event.status IN ('blocked', 'failed')
+        )::NUMERIC / COUNT(event.id)::NUMERIC,
+        6
+      )
+    END AS error_rate,
+    EXTRACT(EPOCH FROM (
+      COALESCE(run.completed_at, now()) - COALESCE(run.started_at, run.created_at)
+    ))::BIGINT,
+    MAX(event.created_at),
+    (
+      SELECT COUNT(*)::BIGINT
+      FROM pg_catalog.pg_locks AS lock
+      WHERE lock.locktype = 'advisory' AND NOT lock.granted
+    )
+  FROM public.rotation_runs AS run
+  LEFT JOIN public.rotation_audit_events AS event ON event.run_id = run.id
+  WHERE run.id = p_run_id
+  GROUP BY run.id;
+END;
+$$;
+
 CREATE FUNCTION public.reject_rotation_evidence_mutation()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -2051,6 +2494,10 @@ ALTER FUNCTION public.purge_rotation_evidence(UUID)
   OWNER TO key_rotation_executor;
 ALTER FUNCTION public.get_key_rotation_status(UUID)
   OWNER TO key_rotation_executor;
+ALTER FUNCTION public.list_active_key_rotation_runs(INTERVAL)
+  OWNER TO key_rotation_executor;
+ALTER FUNCTION public.get_key_rotation_audit_summary(UUID)
+  OWNER TO key_rotation_executor;
 ALTER FUNCTION public.import_rotation_manifest(UUID, TEXT, JSONB)
   OWNER TO key_rotation_executor;
 ALTER FUNCTION public.approve_rotation_manifest(UUID, TEXT, TEXT)
@@ -2082,6 +2529,10 @@ REVOKE ALL ON FUNCTION public.purge_rotation_evidence(UUID)
   FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.get_key_rotation_status(UUID)
   FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.list_active_key_rotation_runs(INTERVAL)
+  FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.get_key_rotation_audit_summary(UUID)
+  FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.enable_key_rotation_operations()
   TO service_role;
 GRANT EXECUTE ON FUNCTION public.prepare_key_rotation_run(UUID, TEXT, UUID, UUID)
@@ -2095,4 +2546,8 @@ GRANT EXECUTE ON FUNCTION public.confirm_previous_key_retirement(UUID)
 GRANT EXECUTE ON FUNCTION public.purge_rotation_evidence(UUID)
   TO service_role;
 GRANT EXECUTE ON FUNCTION public.get_key_rotation_status(UUID)
+  TO service_role;
+GRANT EXECUTE ON FUNCTION public.list_active_key_rotation_runs(INTERVAL)
+  TO service_role;
+GRANT EXECUTE ON FUNCTION public.get_key_rotation_audit_summary(UUID)
   TO service_role;
