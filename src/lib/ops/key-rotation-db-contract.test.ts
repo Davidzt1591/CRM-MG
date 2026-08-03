@@ -463,8 +463,13 @@ describe('046 key rotation database contract — lifecycle and concurrency', () 
     expect(concurrency).toContain('pg_locks');
     expect(concurrency).toContain('lock_timeout');
     expect(concurrency).not.toContain('pg_sleep');
-    expect(concurrency).toMatch(/^\s*BEGIN\s*;/m);
-    expect(concurrency).toMatch(/finish\s*\(\s*\)\s*;\s*ROLLBACK\s*;?\s*$/m);
+    // The concurrency suite must NOT wrap its fixtures in a top-level BEGIN
+    // that stays uncommitted until the end: the remote dblink sessions
+    // (kr_a/kr_b) read rows seeded by this local session, which would be
+    // invisible to them under READ COMMITTED. Assert the suite is not
+    // opened with a suite-level BEGIN.
+    expect(concurrency).not.toMatch(/^\s*BEGIN\s*;/m);
+    expect(concurrency).not.toMatch(/ROLLBACK\s*;?\s*$/m);
     expect(documentation).toContain(
       'control → account barrier → run → item → encrypted row'
     );

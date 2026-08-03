@@ -1,10 +1,13 @@
 -- Deterministic two-session tests for the key-rotation write barrier.
 -- Synchronization observes PostgreSQL lock state with bounded polling; no test
 -- infers blocking from a fixed sleep.
--- Wrap the entire suite in a single transaction so teardown (ROLLBACK)
--- always runs even if an assertion fails partway through, matching the
--- key_rotation_ops suite. This makes the test self-cleaning on re-runs.
-BEGIN;
+-- NOTE: this suite intentionally does NOT wrap its fixtures in a single
+-- BEGIN/ROLLBACK. The remote sessions (kr_a/kr_b) read rows seeded by this
+-- LOCAL session (rotation_items, whatsapp_config, ...). A wrapping transaction
+-- that stays uncommitted would make those rows invisible to the remote
+-- sessions under READ COMMITTED, breaking every concurrency case. Self-cleanup
+-- is instead handled by the explicit teardown DELETEs below (CI resets the
+-- local stack from scratch before each run, so no cross-run residue).
 
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 CREATE EXTENSION IF NOT EXISTS dblink WITH SCHEMA extensions;
@@ -428,4 +431,3 @@ DELETE FROM accounts WHERE id = '82000000-0000-0000-0000-000000000001';
 DELETE FROM auth.users WHERE id::TEXT LIKE '81000000-%';
 SELECT set_config('app.key_rotation_purge', '', FALSE);
 SELECT * FROM finish();
-ROLLBACK;
