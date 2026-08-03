@@ -1,26 +1,31 @@
 import { createClient } from '@supabase/supabase-js';
-import {
-  rotateEncryptedColumns,
-  shouldApplyRotation,
-} from '../src/lib/ops/key-rotation.ts';
+import { config } from 'dotenv';
 
-const apply = shouldApplyRotation(process.argv.slice(2));
-const client = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
-);
+config({
+  path: process.env.KEY_ROTATION_ENV_FILE ?? '.env.local',
+  override: false,
+  quiet: true,
+});
 
-try {
-  console.log(
-    apply
-      ? 'Applying encryption key rotation.'
-      : 'Dry run only; pass --apply to write changes.'
+async function main(): Promise<void> {
+  const [{ runKeyRotationCli }, { rotateEncryptedColumns }] = await Promise.all(
+    [
+      import('../src/lib/ops/key-rotation-cli'),
+      import('../src/lib/ops/key-rotation'),
+    ]
   );
-  const summary = await rotateEncryptedColumns(client, { apply });
-  console.log(
-    `Key rotation complete: ${summary.planned} planned, ${summary.rotated} rotated, ${summary.skipped} skipped.`
-  );
-} catch (error) {
-  console.error(error);
-  process.exitCode = 1;
+
+  process.exitCode = await runKeyRotationCli({
+    args: process.argv.slice(2),
+    createClient,
+    env: process.env,
+    rotate: rotateEncryptedColumns,
+    stderr: console.error,
+    stdout: console.log,
+  });
 }
+
+void main().catch((error: unknown) => {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exitCode = 1;
+});
