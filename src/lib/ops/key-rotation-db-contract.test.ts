@@ -131,6 +131,9 @@ describe('046 key rotation database contract — schema foundation', () => {
     expect(sql).toContain('extensions.digest(');
     expect(sql).not.toMatch(/(?<!extensions\.)\bdigest\(/);
     expect(sql).toContain('REVOKE CREATE ON SCHEMA public FROM PUBLIC');
+    expect(sql).toContain(
+      'GRANT USAGE, CREATE ON SCHEMA public TO key_rotation_executor'
+    );
     expect(securityDefiners).not.toBeNull();
     for (const definition of securityDefiners ?? []) {
       expect(definition).toContain('SET search_path = pg_catalog, public');

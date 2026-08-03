@@ -32,7 +32,8 @@ BEGIN
 END
 $$;
 
-GRANT USAGE ON SCHEMA public, auth, extensions TO key_rotation_executor;
+GRANT USAGE, CREATE ON SCHEMA public TO key_rotation_executor;
+GRANT USAGE ON SCHEMA auth, extensions TO key_rotation_executor;
 GRANT EXECUTE ON FUNCTION auth.role(), auth.uid() TO key_rotation_executor;
 GRANT EXECUTE ON FUNCTION extensions.digest(BYTEA, TEXT)
   TO key_rotation_executor;
