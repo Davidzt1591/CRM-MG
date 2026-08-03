@@ -43,7 +43,9 @@ describe('046 key rotation database contract — schema foundation', () => {
     for (const table of tables) {
       expect(sql).toContain(`CREATE TABLE ${table}`);
       const definition = tableDefinition(sql, table);
-      expect(definition).not.toMatch(/\b(?:plaintext|ciphertext|secret_value)\b/i);
+      expect(definition).not.toMatch(
+        /\b(?:plaintext|ciphertext|secret_value)\b/i
+      );
     }
   });
 
@@ -121,15 +123,17 @@ describe('046 key rotation database contract — atomic rotation RPC', () => {
   it('uses a closed table/path allow-list and validates bounded GCM values', () => {
     const sql = migration();
 
-    expect(sql).toContain("CASE p_table");
+    expect(sql).toContain('CASE p_table');
     expect(sql).toContain("WHEN 'whatsapp_config'");
     expect(sql).toContain("WHEN 'salesforce_config'");
     expect(sql).toContain("WHEN 'ai_configs'");
     expect(sql).toContain("WHEN 'webhook_endpoints'");
     expect(sql).toContain("jsonb_typeof(p_values) <> 'object'");
-    expect(sql).toContain('rotation payload keys do not match the manifest item');
+    expect(sql).toContain(
+      'rotation payload keys do not match the manifest item'
+    );
     expect(sql).toMatch(/octet_length\([^)]*\) > 16384/);
-    expect(sql).toContain("^[0-9a-f]{24}:[0-9a-f]*:[0-9a-f]{32}$");
+    expect(sql).toContain('^[0-9a-f]{24}:[0-9a-f]*:[0-9a-f]{32}$');
     expect(sql).not.toMatch(/\bEXECUTE\s+format\s*\(/i);
   });
 
@@ -184,7 +188,9 @@ describe('046 key rotation database contract — dual-control CBC manifests', ()
     expect(sql).toMatch(
       /digest\(\s*convert_to\(v_canonical_entries::TEXT, 'UTF8'\), 'sha256'\s*\)/
     );
-    expect(sql).toContain('v_computed_digest IS DISTINCT FROM v_submitted_digest');
+    expect(sql).toContain(
+      'v_computed_digest IS DISTINCT FROM v_submitted_digest'
+    );
     expect(sql).toContain('rotation_manifest_entry_digest_matches');
   });
 
@@ -196,11 +202,11 @@ describe('046 key rotation database contract — dual-control CBC manifests', ()
     expect(entryDefinition).toContain('value_format TEXT NOT NULL');
     expect(entryDefinition).toContain('legacy_owner TEXT NOT NULL');
     expect(entryDefinition).toContain('value_digest BYTEA NOT NULL');
-    expect(entryDefinition).not.toMatch(/plaintext|ciphertext|encrypted_value/i);
-    expect(sql).toContain("legacy_owner = 'unknown'");
-    expect(sql).toMatch(
-      /legacy_owner\s+NOT IN\s*\('current', 'previous'\)/
+    expect(entryDefinition).not.toMatch(
+      /plaintext|ciphertext|encrypted_value/i
     );
+    expect(sql).toContain("legacy_owner = 'unknown'");
+    expect(sql).toMatch(/legacy_owner\s+NOT IN\s*\('current', 'previous'\)/);
   });
 
   it('requires separate authorized preparer and approver identities', () => {
@@ -225,7 +231,9 @@ describe('046 key rotation database contract — dual-control CBC manifests', ()
   it('makes manifest and approval evidence immutable outside authorized retention purge', () => {
     const sql = migration();
 
-    expect(sql).toContain('CREATE FUNCTION reject_rotation_evidence_mutation()');
+    expect(sql).toContain(
+      'CREATE FUNCTION reject_rotation_evidence_mutation()'
+    );
     for (const table of [
       'rotation_manifests',
       'rotation_manifest_entries',
