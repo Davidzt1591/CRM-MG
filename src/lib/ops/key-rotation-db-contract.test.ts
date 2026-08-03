@@ -173,3 +173,66 @@ describe('046 key rotation database contract — atomic rotation RPC', () => {
     expect(sql).not.toMatch(/RAISE[^;]*(?:p_values|SQLERRM)/i);
   });
 });
+
+describe('046 key rotation database contract — dual-control CBC manifests', () => {
+  it('defines canonical digest-bound import and approval RPCs', () => {
+    const sql = migration();
+
+    expect(sql).toContain('CREATE FUNCTION import_rotation_manifest(');
+    expect(sql).toContain('CREATE FUNCTION approve_rotation_manifest(');
+    expect(sql).toContain('jsonb_agg(entry ORDER BY');
+    expect(sql).toMatch(
+      /digest\(\s*convert_to\(v_canonical_entries::TEXT, 'UTF8'\), 'sha256'\s*\)/
+    );
+    expect(sql).toContain('v_computed_digest IS DISTINCT FROM v_submitted_digest');
+    expect(sql).toContain('rotation_manifest_entry_digest_matches');
+  });
+
+  it('enforces row/path ownership evidence without storing encrypted values', () => {
+    const sql = migration();
+    const entryDefinition = tableDefinition(sql, 'rotation_manifest_entries');
+
+    expect(entryDefinition).toContain('value_path TEXT NOT NULL');
+    expect(entryDefinition).toContain('value_format TEXT NOT NULL');
+    expect(entryDefinition).toContain('legacy_owner TEXT NOT NULL');
+    expect(entryDefinition).toContain('value_digest BYTEA NOT NULL');
+    expect(entryDefinition).not.toMatch(/plaintext|ciphertext|encrypted_value/i);
+    expect(sql).toContain("legacy_owner = 'unknown'");
+    expect(sql).toMatch(
+      /legacy_owner\s+NOT IN\s*\('current', 'previous'\)/
+    );
+  });
+
+  it('requires separate authorized preparer and approver identities', () => {
+    const sql = migration();
+
+    expect(sql).toContain("account_role IN ('owner', 'admin')");
+    expect(sql).toContain('v_preparer_id = v_approver_id');
+    expect(sql).toContain("'role_collision'::TEXT");
+    expect(sql).toContain('rotation_manifest_approvals');
+  });
+
+  it('invalidates prior approval by requiring the latest manifest revision', () => {
+    const sql = migration();
+
+    expect(sql).toContain('ORDER BY revision DESC');
+    expect(sql).toContain("status = 'awaiting_approval'");
+    expect(sql).toContain("THEN 'manifest_reimported'");
+    expect(sql).toContain('rotation_item_has_approved_manifest');
+    expect(sql).toContain('IF NOT rotation_item_has_approved_manifest');
+  });
+
+  it('makes manifest and approval evidence immutable outside authorized retention purge', () => {
+    const sql = migration();
+
+    expect(sql).toContain('CREATE FUNCTION reject_rotation_evidence_mutation()');
+    for (const table of [
+      'rotation_manifests',
+      'rotation_manifest_entries',
+      'rotation_manifest_approvals',
+    ]) {
+      expect(sql).toContain(`CREATE TRIGGER ${table}_immutable`);
+    }
+    expect(sql).toContain("current_setting('app.key_rotation_purge', TRUE)");
+  });
+});

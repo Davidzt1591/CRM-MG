@@ -106,6 +106,7 @@ VALUES (TRUE);
 
 CREATE TABLE rotation_runs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
   mode TEXT NOT NULL
     CONSTRAINT rotation_run_mode_check CHECK (mode IN ('dry_run', 'apply', 'final_audit')),
   status TEXT NOT NULL DEFAULT 'planned'
@@ -148,12 +149,13 @@ CREATE TABLE rotation_runs (
   ),
   CONSTRAINT rotation_run_counts_check CHECK (
     visited_items <= expected_items AND terminal_items <= visited_items
-  )
+  ),
+  UNIQUE (id, account_id)
 );
 
 CREATE TABLE rotation_items (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  run_id UUID NOT NULL REFERENCES rotation_runs(id) ON DELETE RESTRICT,
+  run_id UUID NOT NULL,
   sequence BIGINT NOT NULL CHECK (sequence > 0),
   account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
   table_name TEXT NOT NULL
@@ -189,6 +191,8 @@ CREATE TABLE rotation_items (
   UNIQUE (run_id, id),
   UNIQUE (run_id, table_name, row_id),
   UNIQUE (run_id, sequence),
+  CONSTRAINT rotation_item_run_account_fk FOREIGN KEY (run_id, account_id)
+    REFERENCES rotation_runs(id, account_id) ON DELETE RESTRICT,
   CONSTRAINT rotation_item_paths_allowed CHECK (
     CASE table_name
       WHEN 'whatsapp_config' THEN target_paths <@ ARRAY[
@@ -291,6 +295,7 @@ CREATE TABLE rotation_audit_events (
     CONSTRAINT rotation_audit_reason_check CHECK (
       reason_code IN (
         'none', 'created', 'applied', 'already_applied',
+        'manifest_pending', 'manifest_reimported',
         'version_conflict', 'row_missing', 'invalid_payload',
         'approval_required', 'unknown_ownership', 'digest_mismatch',
         'role_collision', 'operations_disabled', 'operator_disabled',
@@ -401,6 +406,140 @@ GRANT EXECUTE ON FUNCTION assert_key_rotation_rollback_safe() TO service_role;
 -- No DROP statements belong in this production migration. If a fix-forward
 -- rollback is ever proposed, call assert_key_rotation_rollback_safe() first;
 -- retained or active evidence deliberately blocks destructive reversal.
+
+-- Digest matching is internal and returns only a boolean. It never exposes the
+-- stored value or its digest through an API response.
+CREATE FUNCTION rotation_manifest_entry_digest_matches(
+  p_entry rotation_manifest_entries
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_stored_value TEXT;
+BEGIN
+  CASE p_entry.table_name
+    WHEN 'whatsapp_config' THEN
+      SELECT CASE p_entry.value_path
+        WHEN 'access_token' THEN access_token
+        WHEN 'verify_token' THEN verify_token
+        WHEN 'provider_config.apiKey' THEN provider_config ->> 'apiKey'
+        WHEN 'provider_config.secret' THEN provider_config ->> 'secret'
+      END
+      INTO v_stored_value
+      FROM whatsapp_config
+      WHERE id = p_entry.row_id AND account_id = p_entry.account_id;
+    WHEN 'salesforce_config' THEN
+      SELECT CASE p_entry.value_path
+        WHEN 'client_id' THEN client_id
+        WHEN 'client_secret' THEN client_secret
+        WHEN 'username' THEN username
+        WHEN 'password' THEN password
+        WHEN 'security_token' THEN security_token
+        WHEN 'webhook_secret' THEN webhook_secret
+      END
+      INTO v_stored_value
+      FROM salesforce_config
+      WHERE id = p_entry.row_id AND account_id = p_entry.account_id;
+    WHEN 'ai_configs' THEN
+      SELECT CASE p_entry.value_path
+        WHEN 'api_key' THEN api_key
+        WHEN 'embeddings_api_key' THEN embeddings_api_key
+      END
+      INTO v_stored_value
+      FROM ai_configs
+      WHERE id = p_entry.row_id AND account_id = p_entry.account_id;
+    WHEN 'webhook_endpoints' THEN
+      SELECT secret
+      INTO v_stored_value
+      FROM webhook_endpoints
+      WHERE id = p_entry.row_id AND account_id = p_entry.account_id
+        AND p_entry.value_path = 'secret';
+    ELSE
+      RETURN FALSE;
+  END CASE;
+
+  RETURN v_stored_value IS NOT NULL AND
+    CASE p_entry.value_format
+      WHEN 'gcm' THEN
+        v_stored_value ~ '^[0-9a-f]{24}:[0-9a-f]*:[0-9a-f]{32}$'
+      WHEN 'cbc' THEN
+        v_stored_value ~ '^[0-9a-f]{32}:[0-9a-f]+$'
+      ELSE FALSE
+    END AND
+    digest(convert_to(v_stored_value, 'UTF8'), 'sha256') = p_entry.value_digest;
+END;
+$$;
+
+CREATE FUNCTION rotation_item_has_approved_manifest(
+  p_run_id UUID,
+  p_item_id UUID
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_manifest_id UUID;
+  v_item rotation_items%ROWTYPE;
+BEGIN
+  SELECT m.id
+  INTO v_manifest_id
+  FROM rotation_manifests m
+  WHERE m.run_id = p_run_id
+  ORDER BY revision DESC
+  LIMIT 1;
+
+  IF v_manifest_id IS NULL OR NOT EXISTS (
+    SELECT 1
+    FROM rotation_manifest_approvals a
+    JOIN rotation_manifests m ON m.id = a.manifest_id
+    WHERE a.manifest_id = v_manifest_id
+      AND a.run_id = p_run_id
+      AND a.manifest_digest = m.manifest_digest
+      AND a.decision = 'approved'
+  ) THEN
+    RETURN FALSE;
+  END IF;
+
+  SELECT * INTO v_item
+  FROM rotation_items
+  WHERE run_id = p_run_id AND id = p_item_id;
+  IF NOT FOUND THEN
+    RETURN FALSE;
+  END IF;
+
+  RETURN NOT EXISTS (
+    SELECT 1
+    FROM unnest(v_item.target_paths) AS required(value_path)
+    LEFT JOIN rotation_manifest_entries e
+      ON e.manifest_id = v_manifest_id
+     AND e.run_id = v_item.run_id
+     AND e.account_id = v_item.account_id
+     AND e.table_name = v_item.table_name
+     AND e.row_id = v_item.row_id
+     AND e.value_path = required.value_path
+    WHERE e.id IS NULL
+       OR e.legacy_owner = 'unknown'
+       OR (e.value_format = 'gcm' AND e.legacy_owner <> 'current')
+       OR (e.value_format = 'cbc' AND e.legacy_owner NOT IN ('current', 'previous'))
+  );
+END;
+$$;
+
+ALTER FUNCTION rotation_manifest_entry_digest_matches(rotation_manifest_entries)
+  OWNER TO key_rotation_executor;
+ALTER FUNCTION rotation_item_has_approved_manifest(UUID, UUID)
+  OWNER TO key_rotation_executor;
+REVOKE ALL ON FUNCTION rotation_manifest_entry_digest_matches(rotation_manifest_entries)
+  FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION rotation_item_has_approved_manifest(UUID, UUID)
+  FROM PUBLIC, anon, authenticated, service_role;
 
 -- ============================================================
 -- Task 4.2 — atomic, idempotent, service-role-only row rotation
@@ -518,6 +657,13 @@ BEGIN
     RETURN;
   END IF;
 
+  IF NOT rotation_item_has_approved_manifest(p_run_id, p_item_id) THEN
+    RETURN QUERY SELECT
+      'rejected'::TEXT, v_account_id, NULL::BIGINT, NULL::UUID,
+      'approval_required'::TEXT;
+    RETURN;
+  END IF;
+
   IF jsonb_typeof(p_values) <> 'object' THEN
     RAISE EXCEPTION 'rotation payload must be an object' USING ERRCODE = '22023';
   END IF;
@@ -566,65 +712,65 @@ BEGIN
           to_jsonb(p_values ->> 'provider_config.secret'), TRUE);
       END IF;
 
-      UPDATE whatsapp_config
+      UPDATE whatsapp_config AS w
       SET access_token = CASE
             WHEN p_values ? 'access_token' THEN p_values ->> 'access_token'
-            ELSE access_token
+            ELSE w.access_token
           END,
           verify_token = CASE
             WHEN p_values ? 'verify_token' THEN p_values ->> 'verify_token'
-            ELSE verify_token
+            ELSE w.verify_token
           END,
           provider_config = v_provider_config
-      WHERE id = p_row_id
-        AND account_id = v_account_id
-        AND secret_version = p_expected_version
-        AND secret_fingerprint = p_expected_fingerprint
-      RETURNING whatsapp_config.account_id, secret_version, secret_fingerprint
+      WHERE w.id = p_row_id
+        AND w.account_id = v_account_id
+        AND w.secret_version = p_expected_version
+        AND w.secret_fingerprint = p_expected_fingerprint
+      RETURNING w.account_id, w.secret_version, w.secret_fingerprint
       INTO v_account_id, v_new_version, v_new_fingerprint;
 
     WHEN 'salesforce_config' THEN
-      UPDATE salesforce_config
+      UPDATE salesforce_config AS s
       SET client_id = CASE WHEN p_values ? 'client_id'
-            THEN p_values ->> 'client_id' ELSE client_id END,
+            THEN p_values ->> 'client_id' ELSE s.client_id END,
           client_secret = CASE WHEN p_values ? 'client_secret'
-            THEN p_values ->> 'client_secret' ELSE client_secret END,
+            THEN p_values ->> 'client_secret' ELSE s.client_secret END,
           username = CASE WHEN p_values ? 'username'
-            THEN p_values ->> 'username' ELSE username END,
+            THEN p_values ->> 'username' ELSE s.username END,
           password = CASE WHEN p_values ? 'password'
-            THEN p_values ->> 'password' ELSE password END,
+            THEN p_values ->> 'password' ELSE s.password END,
           security_token = CASE WHEN p_values ? 'security_token'
-            THEN p_values ->> 'security_token' ELSE security_token END,
+            THEN p_values ->> 'security_token' ELSE s.security_token END,
           webhook_secret = CASE WHEN p_values ? 'webhook_secret'
-            THEN p_values ->> 'webhook_secret' ELSE webhook_secret END
-      WHERE id = p_row_id
-        AND account_id = v_account_id
-        AND secret_version = p_expected_version
-        AND secret_fingerprint = p_expected_fingerprint
-      RETURNING salesforce_config.account_id, secret_version, secret_fingerprint
+            THEN p_values ->> 'webhook_secret' ELSE s.webhook_secret END
+      WHERE s.id = p_row_id
+        AND s.account_id = v_account_id
+        AND s.secret_version = p_expected_version
+        AND s.secret_fingerprint = p_expected_fingerprint
+      RETURNING s.account_id, s.secret_version, s.secret_fingerprint
       INTO v_account_id, v_new_version, v_new_fingerprint;
 
     WHEN 'ai_configs' THEN
-      UPDATE ai_configs
+      UPDATE ai_configs AS a
       SET api_key = CASE WHEN p_values ? 'api_key'
-            THEN p_values ->> 'api_key' ELSE api_key END,
+            THEN p_values ->> 'api_key' ELSE a.api_key END,
           embeddings_api_key = CASE WHEN p_values ? 'embeddings_api_key'
-            THEN p_values ->> 'embeddings_api_key' ELSE embeddings_api_key END
-      WHERE id = p_row_id
-        AND account_id = v_account_id
-        AND secret_version = p_expected_version
-        AND secret_fingerprint = p_expected_fingerprint
-      RETURNING ai_configs.account_id, secret_version, secret_fingerprint
+            THEN p_values ->> 'embeddings_api_key' ELSE a.embeddings_api_key END
+      WHERE a.id = p_row_id
+        AND a.account_id = v_account_id
+        AND a.secret_version = p_expected_version
+        AND a.secret_fingerprint = p_expected_fingerprint
+      RETURNING a.account_id, a.secret_version, a.secret_fingerprint
       INTO v_account_id, v_new_version, v_new_fingerprint;
 
     WHEN 'webhook_endpoints' THEN
-      UPDATE webhook_endpoints
+      UPDATE webhook_endpoints AS h
       SET secret = p_values ->> 'secret'
-      WHERE id = p_row_id
-        AND account_id = v_account_id
-        AND secret_version = p_expected_version
-        AND secret_fingerprint = p_expected_fingerprint
-      RETURNING webhook_endpoints.account_id, secret_version, secret_fingerprint
+      WHERE h.id = p_row_id
+        AND h.account_id = v_account_id
+        AND h.secret_version = p_expected_version
+        AND h.secret_fingerprint = p_expected_fingerprint
+      RETURNING h.account_id, h.secret_version, h.secret_fingerprint
       INTO v_account_id, v_new_version, v_new_fingerprint;
 
     ELSE
@@ -637,17 +783,17 @@ BEGIN
   IF v_new_version IS NULL THEN
     CASE p_table
       WHEN 'whatsapp_config' THEN
-        SELECT EXISTS (SELECT 1 FROM whatsapp_config
-          WHERE id = p_row_id AND account_id = v_account_id) INTO v_row_exists;
+        SELECT EXISTS (SELECT 1 FROM whatsapp_config w
+          WHERE w.id = p_row_id AND w.account_id = v_account_id) INTO v_row_exists;
       WHEN 'salesforce_config' THEN
-        SELECT EXISTS (SELECT 1 FROM salesforce_config
-          WHERE id = p_row_id AND account_id = v_account_id) INTO v_row_exists;
+        SELECT EXISTS (SELECT 1 FROM salesforce_config s
+          WHERE s.id = p_row_id AND s.account_id = v_account_id) INTO v_row_exists;
       WHEN 'ai_configs' THEN
-        SELECT EXISTS (SELECT 1 FROM ai_configs
-          WHERE id = p_row_id AND account_id = v_account_id) INTO v_row_exists;
+        SELECT EXISTS (SELECT 1 FROM ai_configs a
+          WHERE a.id = p_row_id AND a.account_id = v_account_id) INTO v_row_exists;
       WHEN 'webhook_endpoints' THEN
-        SELECT EXISTS (SELECT 1 FROM webhook_endpoints
-          WHERE id = p_row_id AND account_id = v_account_id) INTO v_row_exists;
+        SELECT EXISTS (SELECT 1 FROM webhook_endpoints h
+          WHERE h.id = p_row_id AND h.account_id = v_account_id) INTO v_row_exists;
       ELSE v_row_exists := FALSE;
     END CASE;
 
@@ -714,3 +860,368 @@ REVOKE ALL ON FUNCTION rotate_encrypted_row(
 GRANT EXECUTE ON FUNCTION rotate_encrypted_row(
   UUID, UUID, TEXT, UUID, BIGINT, UUID, JSONB
 ) TO service_role;
+
+-- ============================================================
+-- Task 4.3 — immutable row/path ownership evidence and dual control
+-- ============================================================
+CREATE FUNCTION import_rotation_manifest(
+  p_run_id UUID,
+  p_manifest_digest TEXT,
+  p_entries JSONB
+)
+RETURNS TABLE (
+  manifest_id UUID,
+  revision INTEGER,
+  manifest_digest TEXT,
+  status TEXT,
+  reason_code TEXT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_preparer_id UUID := auth.uid();
+  v_run_account_id UUID;
+  v_manifest_id UUID;
+  v_revision INTEGER;
+  v_prior_revisions INTEGER;
+  v_canonical_entries JSONB;
+  v_computed_digest BYTEA;
+  v_submitted_digest BYTEA;
+BEGIN
+  IF auth.role() <> 'authenticated' OR v_preparer_id IS NULL THEN
+    RAISE EXCEPTION 'manifest authorization failed' USING ERRCODE = '42501';
+  END IF;
+  IF p_manifest_digest !~ '^[0-9a-f]{64}$' OR
+     jsonb_typeof(p_entries) <> 'array' OR
+     jsonb_array_length(p_entries) = 0 THEN
+    RAISE EXCEPTION 'invalid manifest evidence' USING ERRCODE = '22023';
+  END IF;
+
+  SELECT account_id INTO v_run_account_id
+  FROM rotation_runs
+  WHERE id = p_run_id
+  FOR UPDATE;
+  IF NOT FOUND OR NOT EXISTS (
+    SELECT 1 FROM profiles
+    WHERE user_id = v_preparer_id
+      AND account_id = v_run_account_id
+      AND account_role IN ('owner', 'admin')
+  ) THEN
+    RAISE EXCEPTION 'manifest authorization failed' USING ERRCODE = '42501';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM jsonb_array_elements(p_entries) AS entries(entry)
+    WHERE (entry - ARRAY[
+      'account_id', 'table_name', 'row_id', 'value_path', 'value_format',
+      'legacy_owner', 'value_digest'
+    ]::TEXT[]) <> '{}'::JSONB
+       OR NOT (entry ?& ARRAY[
+         'account_id', 'table_name', 'row_id', 'value_path', 'value_format',
+         'legacy_owner', 'value_digest'
+       ]::TEXT[])
+       OR entry ->> 'account_id' <> v_run_account_id::TEXT
+       OR entry ->> 'table_name' NOT IN (
+         'whatsapp_config', 'salesforce_config', 'ai_configs', 'webhook_endpoints'
+       )
+       OR entry ->> 'value_format' NOT IN ('gcm', 'cbc')
+       OR entry ->> 'legacy_owner' NOT IN ('current', 'previous', 'unknown')
+       OR (entry ->> 'value_format' = 'gcm' AND entry ->> 'legacy_owner' <> 'current')
+       OR entry ->> 'value_digest' !~ '^[0-9a-f]{64}$'
+  ) THEN
+    RAISE EXCEPTION 'invalid manifest evidence' USING ERRCODE = '22023';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM jsonb_array_elements(p_entries) AS entries(entry)
+    GROUP BY
+      entry ->> 'table_name', entry ->> 'row_id', entry ->> 'value_path'
+    HAVING COUNT(*) > 1
+  ) THEN
+    RAISE EXCEPTION 'conflicting manifest evidence' USING ERRCODE = '22023';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM jsonb_array_elements(p_entries) AS entries(entry)
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM rotation_items i
+      WHERE i.run_id = p_run_id
+        AND i.account_id = (entry ->> 'account_id')::UUID
+        AND i.table_name = entry ->> 'table_name'
+        AND i.row_id = (entry ->> 'row_id')::UUID
+        AND entry ->> 'value_path' = ANY(i.target_paths)
+    )
+  ) OR EXISTS (
+    SELECT 1
+    FROM rotation_items i
+    CROSS JOIN LATERAL unnest(i.target_paths) AS required(value_path)
+    WHERE i.run_id = p_run_id
+      AND NOT EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(p_entries) AS entries(entry)
+        WHERE entry ->> 'account_id' = i.account_id::TEXT
+          AND entry ->> 'table_name' = i.table_name
+          AND entry ->> 'row_id' = i.row_id::TEXT
+          AND entry ->> 'value_path' = required.value_path
+      )
+  ) THEN
+    RAISE EXCEPTION 'manifest paths do not match rotation items'
+      USING ERRCODE = '22023';
+  END IF;
+
+  SELECT jsonb_agg(entry ORDER BY
+    entry ->> 'account_id', entry ->> 'table_name', entry ->> 'row_id',
+    entry ->> 'value_path'
+  )
+  INTO v_canonical_entries
+  FROM jsonb_array_elements(p_entries) AS entries(entry);
+
+  v_computed_digest := digest(
+    convert_to(v_canonical_entries::TEXT, 'UTF8'), 'sha256'
+  );
+  v_submitted_digest := decode(p_manifest_digest, 'hex');
+  IF v_computed_digest IS DISTINCT FROM v_submitted_digest THEN
+    RAISE EXCEPTION 'manifest digest mismatch' USING ERRCODE = '22000';
+  END IF;
+
+  SELECT COUNT(*), COALESCE(MAX(m.revision), 0) + 1
+  INTO v_prior_revisions, v_revision
+  FROM rotation_manifests m
+  WHERE m.run_id = p_run_id;
+
+  INSERT INTO rotation_manifests (
+    run_id, revision, preparer_id, manifest_digest, entry_count
+  ) VALUES (
+    p_run_id, v_revision, v_preparer_id, v_computed_digest,
+    jsonb_array_length(v_canonical_entries)
+  )
+  RETURNING id INTO v_manifest_id;
+
+  INSERT INTO rotation_manifest_entries (
+    manifest_id, run_id, account_id, table_name, row_id, value_path,
+    value_format, legacy_owner, value_digest
+  )
+  SELECT
+    v_manifest_id,
+    p_run_id,
+    (entry ->> 'account_id')::UUID,
+    entry ->> 'table_name',
+    (entry ->> 'row_id')::UUID,
+    entry ->> 'value_path',
+    entry ->> 'value_format',
+    entry ->> 'legacy_owner',
+    decode(entry ->> 'value_digest', 'hex')
+  FROM jsonb_array_elements(v_canonical_entries) AS entries(entry);
+
+  UPDATE rotation_runs
+  SET status = 'awaiting_approval',
+      reason_code = CASE
+        WHEN v_prior_revisions > 0 THEN 'manifest_reimported'
+        ELSE 'manifest_pending'
+      END
+  WHERE id = p_run_id;
+
+  INSERT INTO rotation_audit_events (
+    run_id, account_id, actor_id, event_type, status, reason_code
+  ) VALUES (
+    p_run_id, v_run_account_id, v_preparer_id, 'manifest_imported',
+    'accepted',
+    CASE WHEN v_prior_revisions > 0
+      THEN 'manifest_reimported' ELSE 'manifest_pending' END
+  );
+
+  RETURN QUERY SELECT
+    v_manifest_id,
+    v_revision,
+    encode(v_computed_digest, 'hex'),
+    'awaiting_approval'::TEXT,
+    CASE WHEN v_prior_revisions > 0
+      THEN 'manifest_reimported' ELSE 'manifest_pending' END::TEXT;
+END;
+$$;
+
+CREATE FUNCTION approve_rotation_manifest(
+  p_run_id UUID,
+  p_manifest_digest TEXT,
+  p_decision TEXT
+)
+RETURNS TABLE (
+  outcome TEXT,
+  reason_code TEXT,
+  manifest_id UUID
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_approver_id UUID := auth.uid();
+  v_manifest_id UUID;
+  v_preparer_id UUID;
+  v_run_account_id UUID;
+  v_stored_digest BYTEA;
+BEGIN
+  IF auth.role() <> 'authenticated' OR v_approver_id IS NULL THEN
+    RAISE EXCEPTION 'manifest authorization failed' USING ERRCODE = '42501';
+  END IF;
+  IF p_manifest_digest !~ '^[0-9a-f]{64}$' OR
+     p_decision NOT IN ('approved', 'rejected') THEN
+    RAISE EXCEPTION 'invalid approval evidence' USING ERRCODE = '22023';
+  END IF;
+
+  SELECT m.id, m.preparer_id, m.manifest_digest, r.account_id
+  INTO v_manifest_id, v_preparer_id, v_stored_digest, v_run_account_id
+  FROM rotation_manifests m
+  JOIN rotation_runs r ON r.id = m.run_id
+  WHERE m.run_id = p_run_id
+  ORDER BY revision DESC
+  LIMIT 1
+  FOR UPDATE OF m;
+
+  IF NOT FOUND OR NOT EXISTS (
+    SELECT 1 FROM profiles
+    WHERE user_id = v_approver_id
+      AND account_id = v_run_account_id
+      AND account_role IN ('owner', 'admin')
+  ) THEN
+    RAISE EXCEPTION 'manifest authorization failed' USING ERRCODE = '42501';
+  END IF;
+
+  IF v_preparer_id = v_approver_id THEN
+    INSERT INTO rotation_audit_events (
+      run_id, account_id, actor_id, event_type, status, reason_code
+    ) VALUES (
+      p_run_id, v_run_account_id, v_approver_id,
+      'manifest_rejected', 'blocked', 'role_collision'
+    );
+    RETURN QUERY SELECT
+      'rejected'::TEXT, 'role_collision'::TEXT, v_manifest_id;
+    RETURN;
+  END IF;
+
+  IF v_stored_digest IS DISTINCT FROM decode(p_manifest_digest, 'hex') THEN
+    INSERT INTO rotation_audit_events (
+      run_id, account_id, actor_id, event_type, status, reason_code
+    ) VALUES (
+      p_run_id, v_run_account_id, v_approver_id,
+      'manifest_rejected', 'blocked', 'digest_mismatch'
+    );
+    RETURN QUERY SELECT
+      'rejected'::TEXT, 'digest_mismatch'::TEXT, v_manifest_id;
+    RETURN;
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM rotation_manifest_approvals
+    WHERE rotation_manifest_approvals.manifest_id = v_manifest_id
+  ) THEN
+    RETURN QUERY SELECT
+      'already_recorded'::TEXT, 'none'::TEXT, v_manifest_id;
+    RETURN;
+  END IF;
+
+  IF p_decision = 'approved' AND EXISTS (
+    SELECT 1
+    FROM rotation_manifest_entries
+    WHERE rotation_manifest_entries.manifest_id = v_manifest_id
+      AND legacy_owner = 'unknown'
+  ) THEN
+    RETURN QUERY SELECT
+      'rejected'::TEXT, 'unknown_ownership'::TEXT, v_manifest_id;
+    RETURN;
+  END IF;
+
+  IF p_decision = 'approved' AND EXISTS (
+    SELECT 1
+    FROM rotation_manifest_entries e
+    WHERE e.manifest_id = v_manifest_id
+      AND NOT rotation_manifest_entry_digest_matches(e)
+  ) THEN
+    RETURN QUERY SELECT
+      'rejected'::TEXT, 'digest_mismatch'::TEXT, v_manifest_id;
+    RETURN;
+  END IF;
+
+  INSERT INTO rotation_manifest_approvals (
+    manifest_id, run_id, manifest_digest, decision, approver_id
+  ) VALUES (
+    v_manifest_id, p_run_id, v_stored_digest, p_decision, v_approver_id
+  );
+
+  UPDATE rotation_runs
+  SET status = CASE WHEN p_decision = 'approved' THEN 'approved' ELSE 'blocked' END,
+      reason_code = CASE WHEN p_decision = 'approved' THEN 'none'
+        ELSE 'approval_required' END
+  WHERE id = p_run_id;
+
+  INSERT INTO rotation_audit_events (
+    run_id, account_id, actor_id, event_type, status, reason_code
+  ) VALUES (
+    p_run_id,
+    v_run_account_id,
+    v_approver_id,
+    CASE WHEN p_decision = 'approved'
+      THEN 'manifest_approved' ELSE 'manifest_rejected' END,
+    CASE WHEN p_decision = 'approved' THEN 'accepted' ELSE 'blocked' END,
+    CASE WHEN p_decision = 'approved' THEN 'none' ELSE 'approval_required' END
+  );
+
+  RETURN QUERY SELECT
+    p_decision,
+    CASE WHEN p_decision = 'approved' THEN 'none' ELSE 'approval_required' END,
+    v_manifest_id;
+END;
+$$;
+
+CREATE FUNCTION reject_rotation_evidence_mutation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  IF current_setting('app.key_rotation_purge', TRUE) IS DISTINCT FROM 'authorized' THEN
+    RAISE EXCEPTION 'rotation evidence is immutable' USING ERRCODE = '55000';
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER rotation_manifests_immutable
+  BEFORE UPDATE OR DELETE ON rotation_manifests
+  FOR EACH ROW EXECUTE FUNCTION reject_rotation_evidence_mutation();
+CREATE TRIGGER rotation_manifest_entries_immutable
+  BEFORE UPDATE OR DELETE ON rotation_manifest_entries
+  FOR EACH ROW EXECUTE FUNCTION reject_rotation_evidence_mutation();
+CREATE TRIGGER rotation_manifest_approvals_immutable
+  BEFORE UPDATE OR DELETE ON rotation_manifest_approvals
+  FOR EACH ROW EXECUTE FUNCTION reject_rotation_evidence_mutation();
+CREATE TRIGGER rotation_audit_events_immutable
+  BEFORE UPDATE OR DELETE ON rotation_audit_events
+  FOR EACH ROW EXECUTE FUNCTION reject_rotation_evidence_mutation();
+
+ALTER FUNCTION import_rotation_manifest(UUID, TEXT, JSONB)
+  OWNER TO key_rotation_executor;
+ALTER FUNCTION approve_rotation_manifest(UUID, TEXT, TEXT)
+  OWNER TO key_rotation_executor;
+ALTER FUNCTION reject_rotation_evidence_mutation()
+  OWNER TO key_rotation_executor;
+REVOKE ALL ON FUNCTION import_rotation_manifest(UUID, TEXT, JSONB)
+  FROM PUBLIC, anon, service_role;
+REVOKE ALL ON FUNCTION approve_rotation_manifest(UUID, TEXT, TEXT)
+  FROM PUBLIC, anon, service_role;
+REVOKE ALL ON FUNCTION reject_rotation_evidence_mutation()
+  FROM PUBLIC, anon, authenticated, service_role;
+GRANT EXECUTE ON FUNCTION import_rotation_manifest(UUID, TEXT, JSONB)
+  TO authenticated;
+GRANT EXECUTE ON FUNCTION approve_rotation_manifest(UUID, TEXT, TEXT)
+  TO authenticated;
