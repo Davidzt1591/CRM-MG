@@ -995,7 +995,6 @@
   "Flows": {
     "list": {
       "title": "플로우",
-      "admin": "관리자",
       "beta": "베타",
       "description": "분기하는 버튼 기반 WhatsApp 대화를 만드세요. 메뉴, FAQ, 사람이 개입하기 전 1차 응대에 유용합니다.",
       "newFlow": "새 플로우",
@@ -1231,7 +1230,7 @@
       "tagsAndFields": "태그 및 커스텀 필드",
       "tagsCount": "태그 {count}개",
       "fieldsCount": "커스텀 필드 {count}개",
-      "appearance": "{mode} 모드 · {theme} 색상",
+      "appearance": "{mode} 모드",
       "yourAccount": "내 계정",
       "loading": "불러오는 중…"
     },

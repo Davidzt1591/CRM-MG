@@ -19,8 +19,9 @@ import crypto from 'crypto'
  *   16-byte authentication tag; any tampering fails the decrypt hard.
  *
  * Backward compatibility:
- *   `decrypt()` auto-detects the format by counting parts, so legacy
- *   rows keep working. New `encrypt()` output is always GCM.
+ *   `decrypt()` auto-detects the format by counting parts. New `encrypt()`
+ *   output is always GCM. When two keys are configured, legacy CBC rows
+ *   fail closed because their unauthenticated format has no key identifier.
  *   Existing rows can be upgraded in place by call sites that hold a
  *   Supabase client — see the `isLegacyFormat` / `encrypt` pattern in
  *   `src/app/api/whatsapp/send/route.ts`.
@@ -28,10 +29,9 @@ import crypto from 'crypto'
  * Key rotation:
  *   Set `ENCRYPTION_KEY_PREVIOUS` to the old key (32-byte hex) before
  *   deploying the new `ENCRYPTION_KEY`. `decrypt()` tries the current
- *   key first, then the previous key as fallback. Call `reEncrypt()`
- *   on any value that was decrypted with the previous key to rewrite it
- *   with the current key — this lets you rotate keys without a data
- *   migration window.
+ *   key first, then the previous key as fallback for authenticated GCM.
+ *   Legacy CBC rotation requires explicit key ownership. Call `reEncrypt()`
+ *   to rewrite verified plaintext with the current key.
  */
 
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY!
@@ -121,10 +121,16 @@ function decryptWithKey(encryptedText: string, keyHex: string): string {
 
 /**
  * Decrypt a ciphertext using the current key.
- * Falls back to ENCRYPTION_KEY_PREVIOUS when the current key fails
- * (e.g. the ciphertext was created before a key rotation).
+ * Authenticated GCM falls back to ENCRYPTION_KEY_PREVIOUS when the current
+ * key fails. Legacy CBC fails closed when two keys are configured because
+ * successful padding cannot prove which key owns unauthenticated ciphertext.
  */
 export function decrypt(encryptedText: string): string {
+  if (encryptedText.split(':').length === 2 && ENCRYPTION_KEY_PREVIOUS) {
+    throw new Error(
+      'Legacy CBC ciphertext has ambiguous key ownership; rotate it with an explicit legacy key before enabling fallback decryption',
+    )
+  }
   try {
     return decryptWithKey(encryptedText, ENCRYPTION_KEY)
   } catch (e) {
@@ -141,15 +147,38 @@ export function decrypt(encryptedText: string): string {
 /**
  * Re-encrypt a ciphertext with the current key.
  *
- * Tries the current key first, then ENCRYPTION_KEY_PREVIOUS as fallback
- * (same as `decrypt()`). Re-encrypts with the current key.
+ * Authenticated GCM tries the current key, then ENCRYPTION_KEY_PREVIOUS.
+ * Legacy CBC requires explicit current/previous ownership when both exist.
  *
  * Use this during a key rotation to upgrade stored ciphertexts without
  * a data migration: read each row, call `reEncrypt()`, write the result
  * back. Entries already using the current key are re-encrypted in-place
  * (produces a fresh IV, same plaintext).
  */
-export function reEncrypt(encryptedText: string): string {
+export type LegacyKeyOwnership = 'current' | 'previous'
+
+export function reEncrypt(
+  encryptedText: string,
+  options: { legacyKey?: LegacyKeyOwnership } = {},
+): string {
+  if (encryptedText.split(':').length === 2) {
+    if (ENCRYPTION_KEY_PREVIOUS && !options.legacyKey) {
+      throw new Error(
+        'Legacy CBC ciphertext requires explicit current or previous key ownership',
+      )
+    }
+    if (options.legacyKey === 'previous' && !ENCRYPTION_KEY_PREVIOUS) {
+      throw new Error(
+        'Legacy CBC ciphertext was assigned to the previous key, but ENCRYPTION_KEY_PREVIOUS is not set',
+      )
+    }
+    const legacyKey =
+      options.legacyKey === 'previous'
+        ? ENCRYPTION_KEY_PREVIOUS!
+        : ENCRYPTION_KEY
+    return encrypt(decryptWithKey(encryptedText, legacyKey))
+  }
+
   try {
     return encrypt(decryptWithKey(encryptedText, ENCRYPTION_KEY))
   } catch (e) {

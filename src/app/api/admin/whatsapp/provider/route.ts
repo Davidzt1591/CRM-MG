@@ -1,41 +1,26 @@
 import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
 import { encrypt, decrypt } from '@/lib/whatsapp/encryption'
 import { recordAuditEvent } from '@/lib/audit'
-
-async function resolveAccountId(
-  supabase: Awaited<ReturnType<typeof createClient>>,
-  userId: string,
-): Promise<string | null> {
-  const { data, error } = await supabase
-    .from('profiles')
-    .select('account_id')
-    .eq('user_id', userId)
-    .maybeSingle()
-  if (error || !data?.account_id) return null
-  return data.account_id as string
-}
+import { requireRole, toErrorResponse } from '@/lib/auth/account'
 
 /**
  * GET /api/admin/whatsapp/provider
  *
  * Returns the current provider configuration for the caller's account.
  * Sensitive fields (access_token, api_key, secret) are masked.
+ *
+ * Access is gated by `requireRole("admin")` (D8) — the same boundary the
+ * audit-logs route uses. The caller's account_id and user_id come from the
+ * requireRole context instead of a separate getUser()/resolveAccountId()
+ * lookup, eliminating a second round-trip and the role-bypass surface it
+ * left open (MCRM-58).
  */
 export async function GET() {
   try {
-    const supabase = await createClient()
-    const { data: { user }, error: authError } = await supabase.auth.getUser()
-    if (authError || !user) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
+    const ctx = await requireRole('admin')
+    const accountId = ctx.accountId
 
-    const accountId = await resolveAccountId(supabase, user.id)
-    if (!accountId) {
-      return NextResponse.json({ error: 'No account found' }, { status: 403 })
-    }
-
-    const { data: config, error: dbError } = await supabase
+    const { data: config, error: dbError } = await ctx.supabase
       .from('whatsapp_config')
       .select('provider, provider_config, phone_number_id, waba_id')
       .eq('account_id', accountId)
@@ -67,9 +52,8 @@ export async function GET() {
       api_key: providerConfig.apiKey ? '••••••••••••••••' : '',
       webhook_secret: providerConfig.secret ? '••••••••••••••••' : '',
     })
-  } catch (error) {
-    console.error('[provider-config GET] error:', error)
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+  } catch (err) {
+    return toErrorResponse(err)
   }
 }
 
@@ -82,16 +66,8 @@ export async function GET() {
  */
 export async function POST(request: Request) {
   try {
-    const supabase = await createClient()
-    const { data: { user }, error: authError } = await supabase.auth.getUser()
-    if (authError || !user) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
-
-    const accountId = await resolveAccountId(supabase, user.id)
-    if (!accountId) {
-      return NextResponse.json({ error: 'No account found' }, { status: 403 })
-    }
+    const ctx = await requireRole('admin')
+    const accountId = ctx.accountId
 
     const body = await request.json()
     const { provider, ...rest } = body as {
@@ -112,7 +88,7 @@ export async function POST(request: Request) {
     }
 
     // Fetch the existing config so we can detect provider switches.
-    const { data: existing } = await supabase
+    const { data: existing } = await ctx.supabase
       .from('whatsapp_config')
       .select('provider')
       .eq('account_id', accountId)
@@ -181,7 +157,7 @@ export async function POST(request: Request) {
 
     // Upsert the config row.
     if (existing) {
-      const { error: updateError } = await supabase
+      const { error: updateError } = await ctx.supabase
         .from('whatsapp_config')
         .update(updatePayload)
         .eq('account_id', accountId)
@@ -192,11 +168,13 @@ export async function POST(request: Request) {
       }
     } else {
       // Insert a new row if one doesn't exist (account has no config at all).
-      const { error: insertError } = await supabase
+      const { error: insertError } = await ctx.supabase
         .from('whatsapp_config')
         .insert({
           account_id: accountId,
-          user_id: user.id,
+          // Attributed to the authenticated caller — sourced from the
+          // requireRole context, never a separate getUser() lookup.
+          user_id: ctx.userId,
           ...updatePayload,
         })
 
@@ -210,7 +188,7 @@ export async function POST(request: Request) {
     if (isSwitch) {
       await recordAuditEvent({
         accountId,
-        userId: user.id,
+        userId: ctx.userId,
         action: 'provider.switched',
         targetType: 'whatsapp_config',
         targetId: accountId,
@@ -222,8 +200,7 @@ export async function POST(request: Request) {
     }
 
     return NextResponse.json({ success: true })
-  } catch (error) {
-    console.error('[provider-config POST] error:', error)
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+  } catch (err) {
+    return toErrorResponse(err)
   }
 }
