@@ -368,7 +368,7 @@ describe('046 key rotation database contract — lifecycle and concurrency', () 
     );
   });
 
-  it('enforces the account barrier on normal secret inserts and changes only', () => {
+  it('enforces the account barrier on secret inserts, changes, deletes, and transfers', () => {
     const sql = migration();
     const trigger = functionDefinition(
       sql,
@@ -388,8 +388,75 @@ describe('046 key rotation database contract — lifecycle and concurrency', () 
       'ai_configs',
       'webhook_endpoints',
     ]) {
-      expect(sql).toContain(`BEFORE INSERT OR UPDATE ON ${table}`);
+      expect(sql).toContain(`BEFORE INSERT OR UPDATE OR DELETE ON ${table}`);
     }
+  });
+
+  it('puts encrypted-row DELETE and account transfers under the account barrier', () => {
+    const sql = migration();
+    const trigger = functionDefinition(
+      sql,
+      'bump_key_rotation_secret_metadata'
+    );
+
+    expect(sql).toContain('CREATE FUNCTION public.lock_key_rotation_accounts');
+    expect(trigger).toContain("TG_OP = 'DELETE'");
+    expect(trigger).toMatch(/lock_key_rotation_account\(OLD\.account_id\)/);
+    expect(trigger).toMatch(/NEW\.account_id IS DISTINCT FROM OLD\.account_id/);
+    expect(trigger).toMatch(
+      /lock_key_rotation_accounts\(\s*ARRAY\[OLD\.account_id, NEW\.account_id\]\s*\)/
+    );
+  });
+
+  it('bounds the complete mutating lifecycle transaction with statement and lock timeouts', () => {
+    const sql = migration();
+    const mutating = [
+      'enable_key_rotation_operations',
+      'prepare_key_rotation_run',
+      'start_key_rotation_run',
+      'rotate_encrypted_row',
+      'finalize_key_rotation_run',
+      'confirm_previous_key_retirement',
+      'purge_rotation_evidence',
+      'disable_key_rotation_operations',
+    ];
+
+    for (const name of mutating) {
+      const definition = functionDefinition(sql, name);
+      expect(definition).toMatch(/SET lock_timeout = '[^']+'/);
+      expect(definition).toMatch(/SET statement_timeout = '[^']+'/);
+    }
+  });
+
+  it('handles applied-item replay before rejecting terminal run states', () => {
+    const fn = functionDefinition(migration(), 'rotate_encrypted_row');
+    const replayStart = fn.indexOf("v_item_status = 'applied'");
+    const modeCheck = fn.indexOf("v_run_mode IS DISTINCT FROM 'apply'");
+    const statusCheck = fn.indexOf("v_run_status IS DISTINCT FROM 'running'");
+
+    expect(replayStart).toBeGreaterThan(-1);
+    expect(modeCheck).toBeGreaterThan(-1);
+    expect(statusCheck).toBeGreaterThan(-1);
+    expect(replayStart).toBeLessThan(modeCheck);
+    expect(replayStart).toBeLessThan(statusCheck);
+  });
+
+  it('isolates SQL fixtures from automatic signup bootstrap collisions', () => {
+    const pgTap = readFileSync(pgTapTestPath, 'utf8');
+    const concurrency = readFileSync(concurrencyTestPath, 'utf8');
+
+    for (const sql of [pgTap, concurrency]) {
+      const dropIndex = sql.indexOf(
+        'DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users'
+      );
+      expect(dropIndex).toBeGreaterThan(-1);
+      expect(dropIndex).toBeLessThan(sql.indexOf('INSERT INTO accounts'));
+    }
+    // The non-transactional concurrency suite restores the trigger after its
+    // isolated fixtures so it never leaks a dropped trigger to later files.
+    expect(concurrency).toMatch(
+      /CREATE TRIGGER on_auth_user_created\s+AFTER INSERT ON auth\.users/
+    );
   });
 
   it('reconciles actual inventory under the barrier before finalization and retirement', () => {
@@ -455,6 +522,8 @@ describe('046 key rotation database contract — lifecycle and concurrency', () 
       'retire-vs-secret-write',
       'emergency-disable-vs-rotate',
       'unrelated-jsonb-vs-rotate',
+      'delete-vs-finalize',
+      'transfer-vs-finalize',
     ]) {
       expect(concurrency).toContain(scenario);
     }
@@ -495,7 +564,7 @@ describe('database contract CI gate', () => {
     expect(yaml).toMatch(/version:\s*2\.\d+\.\d+/);
     expect(yaml).toContain('supabase db reset --local --no-seed');
     expect(yaml).toContain('supabase test db --local');
-    expect(plannedAssertions).toBe(114);
+    expect(plannedAssertions).toBe(136);
     expect(yaml).not.toContain('--linked');
     expect(yaml).toContain('supabase stop --no-backup');
   });

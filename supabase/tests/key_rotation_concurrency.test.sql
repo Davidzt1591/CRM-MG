@@ -15,7 +15,15 @@ SET search_path = public, extensions;
 SET lock_timeout = '2s';
 SET statement_timeout = '15s';
 
-SELECT plan(10);
+SELECT plan(14);
+
+-- The signup bootstrap trigger (017_account_sharing.sql) auto-creates an
+-- account and profile for every auth.users row, which collides with the
+-- direct fixtures below: a second account for the same owner violates
+-- idx_accounts_one_per_owner before any assertion runs. Drop the trigger for
+-- the isolated fixtures and restore it right after so later test files keep
+-- the production behavior.
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
 
 INSERT INTO auth.users (
   id, aud, role, email, encrypted_password, raw_app_meta_data,
@@ -57,6 +65,13 @@ INSERT INTO whatsapp_config (
     'region', 'initial'
   )
 );
+
+-- Restore the production signup bootstrap trigger now that the isolated
+-- fixtures are in place (this suite does not run inside a wrapping
+-- transaction, so the restore is required for subsequent test files).
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
 
 SELECT extensions.dblink_connect(
   'kr_a', 'host=127.0.0.1 port=5432 dbname=postgres user=postgres password=postgres'
@@ -404,6 +419,107 @@ SELECT is(
   'unrelated JSONB updates remain preserved'
 );
 
+-- The remaining scenarios exercise lifecycle gates that require operations to
+-- be enabled; restore it deterministically before continuing.
+SELECT public.enable_key_rotation_operations();
+
+-- delete-vs-finalize: finalization holds the account barrier, so a concurrent
+-- DELETE of an encrypted row waits and only removes the row afterwards.
+CREATE TEMP TABLE delete_run AS
+SELECT pg_temp.seed_public_run('dry_run') AS run_id;
+SELECT extensions.dblink_exec('kr_a', 'BEGIN');
+SELECT extensions.dblink_send_query('kr_a', format(
+  $$WITH claims AS MATERIALIZED (
+      SELECT set_config('request.jwt.claims',
+        '{"role":"service_role","sub":"81000000-0000-0000-0000-000000000002"}', FALSE)
+    )
+    SELECT gate.* FROM claims
+    CROSS JOIN LATERAL public.finalize_key_rotation_run(%L) AS gate
+    WHERE claims.set_config IS NOT NULL$$,
+  (SELECT run_id FROM delete_run)
+));
+CREATE TEMP TABLE delete_finalize_result AS
+SELECT * FROM extensions.dblink_get_result('kr_a') AS result(
+  outcome TEXT, reason_code TEXT
+);
+SELECT extensions.dblink_send_query('kr_b', $$DELETE FROM public.whatsapp_config
+  WHERE id = '84000000-0000-0000-0000-000000000001'
+  RETURNING id$$);
+SELECT ok(
+  pg_temp.wait_for_lock(
+    (SELECT pid FROM kr_backend WHERE connection = 'b'), INTERVAL '2 seconds'
+  ),
+  'delete-vs-finalize blocks an encrypted delete on the account barrier'
+);
+SELECT extensions.dblink_exec('kr_a', 'COMMIT');
+SELECT * FROM extensions.dblink_get_result('kr_b') AS result(id UUID);
+SELECT is(
+  (SELECT count(*) FROM public.whatsapp_config
+   WHERE id = '84000000-0000-0000-0000-000000000001'),
+  0,
+  'delete-vs-finalize removes the row only after the gate commits'
+);
+
+-- Re-seed the encrypted row (deleted above) so the transfer scenario has a
+-- source row on the source account.
+INSERT INTO whatsapp_config (
+  id, user_id, account_id, phone_number_id, access_token, provider_config
+) VALUES (
+  '84000000-0000-0000-0000-000000000001',
+  '81000000-0000-0000-0000-000000000001',
+  '82000000-0000-0000-0000-000000000001',
+  'concurrency-phone',
+  repeat('1', 24) || ':' || repeat('2', 32) || ':' || repeat('3', 32),
+  jsonb_build_object(
+    'apiKey', repeat('4', 24) || ':' || repeat('5', 32) || ':' || repeat('6', 32),
+    'region', 'initial'
+  )
+);
+
+-- transfer-vs-finalize: moving an encrypted row to another account acquires
+-- both account barriers in sorted order, so the transfer waits for a
+-- concurrent finalization of the source account.
+INSERT INTO accounts (id, name, owner_user_id) VALUES (
+  '82000000-0000-0000-0000-000000000002',
+  'Rotation transfer target account',
+  '81000000-0000-0000-0000-000000000002'
+);
+CREATE TEMP TABLE transfer_run AS
+SELECT pg_temp.seed_public_run('dry_run') AS run_id;
+SELECT extensions.dblink_exec('kr_a', 'BEGIN');
+SELECT extensions.dblink_send_query('kr_a', format(
+  $$WITH claims AS MATERIALIZED (
+      SELECT set_config('request.jwt.claims',
+        '{"role":"service_role","sub":"81000000-0000-0000-0000-000000000002"}', FALSE)
+    )
+    SELECT gate.* FROM claims
+    CROSS JOIN LATERAL public.finalize_key_rotation_run(%L) AS gate
+    WHERE claims.set_config IS NOT NULL$$,
+  (SELECT run_id FROM transfer_run)
+));
+CREATE TEMP TABLE transfer_finalize_result AS
+SELECT * FROM extensions.dblink_get_result('kr_a') AS result(
+  outcome TEXT, reason_code TEXT
+);
+SELECT extensions.dblink_send_query('kr_b', $$UPDATE public.whatsapp_config
+  SET account_id = '82000000-0000-0000-0000-000000000002'
+  WHERE id = '84000000-0000-0000-0000-000000000001'
+  RETURNING id$$);
+SELECT ok(
+  pg_temp.wait_for_lock(
+    (SELECT pid FROM kr_backend WHERE connection = 'b'), INTERVAL '2 seconds'
+  ),
+  'transfer-vs-finalize blocks an account transfer on the dual-account barrier'
+);
+SELECT extensions.dblink_exec('kr_a', 'COMMIT');
+SELECT * FROM extensions.dblink_get_result('kr_b') AS result(id UUID);
+SELECT is(
+  (SELECT account_id FROM public.whatsapp_config
+   WHERE id = '84000000-0000-0000-0000-000000000001'),
+  '82000000-0000-0000-0000-000000000002'::uuid,
+  'transfer-vs-finalize moves the row only after the gate commits'
+);
+
 SELECT extensions.dblink_disconnect('kr_a');
 SELECT extensions.dblink_disconnect('kr_b');
 SELECT set_config('app.key_rotation_purge', 'authorized', FALSE);
@@ -428,6 +544,7 @@ WHERE account_id = '82000000-0000-0000-0000-000000000001';
 DELETE FROM whatsapp_config WHERE id = '84000000-0000-0000-0000-000000000001';
 DELETE FROM profiles WHERE user_id::TEXT LIKE '81000000-%';
 DELETE FROM accounts WHERE id = '82000000-0000-0000-0000-000000000001';
+DELETE FROM accounts WHERE id = '82000000-0000-0000-0000-000000000002';
 DELETE FROM auth.users WHERE id::TEXT LIKE '81000000-%';
 SELECT set_config('app.key_rotation_purge', '', FALSE);
 SELECT * FROM finish();

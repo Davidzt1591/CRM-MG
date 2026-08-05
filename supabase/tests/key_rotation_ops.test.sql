@@ -1,9 +1,17 @@
 BEGIN;
 
+-- The signup bootstrap trigger (017_account_sharing.sql) auto-creates an
+-- account and profile for every auth.users row, which collides with the
+-- direct fixtures below: a second account for the same owner violates
+-- idx_accounts_one_per_owner before any assertion runs. Drop it for the
+-- isolated fixtures; this suite is transaction-wrapped, so the DROP is
+-- rolled back automatically and the production trigger is restored.
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(104);
+SELECT plan(122);
 
 -- Task 4.1 — expand-only schema and least-privilege foundation.
 SELECT has_table('public', 'rotation_runs', 'rotation_runs exists');
@@ -1185,6 +1193,151 @@ SELECT is(
   )),
   'already_purged',
   'purge replay is idempotent'
+);
+
+-- Slice-4 blocker contract: write barrier coverage (DELETE + account
+-- transfers), bounded lifecycle timeouts, and idempotent replay ordering.
+SELECT has_function(
+  'public', 'lock_key_rotation_accounts', ARRAY['uuid[]'],
+  'multi-account barrier helper exists'
+);
+SELECT throws_ok(
+  'SELECT public.lock_key_rotation_accounts(NULL::uuid[])',
+  'key rotation account is required',
+  'a null account array is rejected'
+);
+SELECT throws_ok(
+  'SELECT public.lock_key_rotation_accounts(ARRAY[NULL::uuid]::uuid[])',
+  'key rotation account is required',
+  'an all-null account array is rejected'
+);
+SELECT lives_ok(
+  'SELECT public.lock_key_rotation_accounts(
+     ARRAY[''20000000-0000-0000-0000-000000000001''::uuid,
+           ''20000000-0000-0000-0000-000000000002''::uuid,
+           ''20000000-0000-0000-0000-000000000001''::uuid])',
+  'duplicate accounts lock idempotently in sorted order'
+);
+SELECT ok(
+  NOT EXISTS (
+    SELECT 1 FROM pg_proc AS p
+    JOIN pg_namespace AS n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'public'
+      AND p.proname IN (
+        'enable_key_rotation_operations', 'prepare_key_rotation_run',
+        'start_key_rotation_run', 'rotate_encrypted_row',
+        'finalize_key_rotation_run', 'confirm_previous_key_retirement',
+        'purge_rotation_evidence', 'disable_key_rotation_operations'
+      )
+      AND NOT ('lock_timeout=8s' = ANY (p.proconfig))
+  ),
+  'every mutating lifecycle function bounds its lock timeout'
+);
+SELECT ok(
+  NOT EXISTS (
+    SELECT 1 FROM pg_proc AS p
+    JOIN pg_namespace AS n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'public'
+      AND p.proname IN (
+        'enable_key_rotation_operations', 'prepare_key_rotation_run',
+        'start_key_rotation_run', 'rotate_encrypted_row',
+        'finalize_key_rotation_run', 'confirm_previous_key_retirement',
+        'purge_rotation_evidence', 'disable_key_rotation_operations'
+      )
+      AND NOT ('statement_timeout=30s' = ANY (p.proconfig))
+  ),
+  'every mutating lifecycle function bounds its statement timeout'
+);
+SELECT ok(
+  NOT EXISTS (
+    SELECT 1 FROM pg_trigger AS t
+    JOIN pg_class AS c ON c.oid = t.tgrelid
+    JOIN pg_namespace AS n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public'
+      AND c.relname IN (
+        'whatsapp_config', 'salesforce_config', 'ai_configs',
+        'webhook_endpoints'
+      )
+      AND t.tgname = c.relname || '_secret_metadata'
+      AND pg_get_triggerdef(t.oid) NOT ILIKE '%OR DELETE%'
+  ),
+  'every secret barrier trigger covers INSERT, UPDATE, and DELETE'
+);
+
+CREATE TEMP TABLE transfer_fingerprint_before AS
+SELECT secret_fingerprint FROM public.whatsapp_config
+WHERE id = '40000000-0000-0000-0000-000000000001';
+SELECT is(
+  (SELECT account_id FROM public.whatsapp_config
+   WHERE id = '40000000-0000-0000-0000-000000000001'),
+  '20000000-0000-0000-0000-000000000001'::uuid,
+  'the encrypted fixture row starts on the source account'
+);
+UPDATE public.whatsapp_config
+SET account_id = '20000000-0000-0000-0000-000000000002'
+WHERE id = '40000000-0000-0000-0000-000000000001';
+SELECT is(
+  (SELECT account_id FROM public.whatsapp_config
+   WHERE id = '40000000-0000-0000-0000-000000000001'),
+  '20000000-0000-0000-0000-000000000002'::uuid,
+  'the transfer moves the encrypted row under the dual-account barrier'
+);
+SELECT is(
+  (SELECT secret_fingerprint FROM public.whatsapp_config
+   WHERE id = '40000000-0000-0000-0000-000000000001'),
+  (SELECT secret_fingerprint FROM transfer_fingerprint_before),
+  'a pure transfer preserves the secret fingerprint'
+);
+CREATE TEMP TABLE transfer_version_before AS
+SELECT secret_version FROM public.whatsapp_config
+WHERE id = '40000000-0000-0000-0000-000000000001';
+UPDATE public.whatsapp_config
+SET access_token =
+  repeat('9', 24) || ':' || repeat('8', 32) || ':' || repeat('7', 32)
+WHERE id = '40000000-0000-0000-0000-000000000001';
+SELECT ok(
+  (SELECT secret_version FROM public.whatsapp_config
+   WHERE id = '40000000-0000-0000-0000-000000000001') >
+  (SELECT secret_version FROM transfer_version_before),
+  'a value-changing update still bumps the version after a transfer'
+);
+SELECT lives_ok(
+  'DELETE FROM public.whatsapp_config
+   WHERE id = ''40000000-0000-0000-0000-000000000001''',
+  'deleting an encrypted whatsapp row is permitted by the barrier'
+);
+SELECT is(
+  (SELECT count(*) FROM public.whatsapp_config
+   WHERE id = '40000000-0000-0000-0000-000000000001'),
+  0,
+  'the deleted whatsapp row is gone'
+);
+SELECT lives_ok(
+  'DELETE FROM public.salesforce_config
+   WHERE id = ''40000000-0000-0000-0000-000000000003''',
+  'deleting an encrypted salesforce row is permitted by the barrier'
+);
+SELECT is(
+  (SELECT count(*) FROM public.salesforce_config
+   WHERE id = '40000000-0000-0000-0000-000000000003'),
+  0,
+  'the deleted salesforce row is gone'
+);
+SELECT lives_ok(
+  'DELETE FROM public.ai_configs
+   WHERE id = ''40000000-0000-0000-0000-000000000004''',
+  'deleting an encrypted ai_config row is permitted by the barrier'
+);
+SELECT is(
+  (SELECT count(*) FROM public.ai_configs
+   WHERE id = '40000000-0000-0000-0000-000000000004'),
+  0,
+  'the deleted ai_config row is gone'
+);
+SELECT lives_ok(
+  'DELETE FROM public.webhook_endpoints
+   WHERE id = ''40000000-0000-0000-0000-000000000002''',
+  'deleting an encrypted webhook row is permitted by the barrier'
 );
 
 SELECT * FROM finish();

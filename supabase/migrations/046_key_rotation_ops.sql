@@ -98,6 +98,39 @@ ALTER TABLE webhook_endpoints
 -- Account-scoped advisory locks are the database write barrier shared by
 -- ordinary application secret writes and rotation lifecycle gates. The hash is
 -- namespaced to this contract; collisions are safe and only reduce concurrency.
+-- Multi-account acquisition (encrypted-row transfers and the DELETE barrier)
+-- sorts the accounts first so any two operations touching the same pair lock
+-- them in the same order and can never deadlock each other.
+CREATE FUNCTION public.lock_key_rotation_accounts(p_account_ids UUID[])
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+SET lock_timeout = '5s'
+AS $$
+DECLARE
+  v_account_id UUID;
+BEGIN
+  IF p_account_ids IS NULL OR cardinality(p_account_ids) = 0 OR
+     NOT EXISTS (
+       SELECT 1 FROM unnest(p_account_ids) AS ids(account_id)
+       WHERE ids.account_id IS NOT NULL
+     ) THEN
+    RAISE EXCEPTION 'key rotation account is required' USING ERRCODE = '22023';
+  END IF;
+  FOR v_account_id IN
+    SELECT DISTINCT ids.account_id
+    FROM unnest(p_account_ids) AS ids(account_id)
+    WHERE ids.account_id IS NOT NULL
+    ORDER BY ids.account_id
+  LOOP
+    PERFORM pg_advisory_xact_lock(
+      hashtextextended('key_rotation:' || v_account_id::TEXT, 0)
+    );
+  END LOOP;
+END;
+$$;
+
 CREATE FUNCTION public.lock_key_rotation_account(p_account_id UUID)
 RETURNS VOID
 LANGUAGE plpgsql
@@ -106,15 +139,14 @@ SET search_path = pg_catalog, public
 SET lock_timeout = '5s'
 AS $$
 BEGIN
-  IF p_account_id IS NULL THEN
-    RAISE EXCEPTION 'key rotation account is required' USING ERRCODE = '22023';
-  END IF;
-  PERFORM pg_advisory_xact_lock(
-    hashtextextended('key_rotation:' || p_account_id::TEXT, 0)
-  );
+  PERFORM public.lock_key_rotation_accounts(ARRAY[p_account_id]);
 END;
 $$;
 
+ALTER FUNCTION public.lock_key_rotation_accounts(UUID[])
+  OWNER TO key_rotation_executor;
+REVOKE ALL ON FUNCTION public.lock_key_rotation_accounts(UUID[])
+  FROM PUBLIC, anon, authenticated, service_role;
 ALTER FUNCTION public.lock_key_rotation_account(UUID)
   OWNER TO key_rotation_executor;
 REVOKE ALL ON FUNCTION public.lock_key_rotation_account(UUID)
@@ -148,6 +180,38 @@ BEGIN
       PERFORM public.lock_key_rotation_account(NEW.account_id);
     END IF;
     RETURN NEW;
+  END IF;
+
+  -- Removing an encrypted row must not race a rotation or finalization of the
+  -- account it belongs to, so DELETE participates in the same write barrier.
+  IF TG_OP = 'DELETE' THEN
+    encrypted_value_changed := CASE TG_TABLE_NAME
+      WHEN 'whatsapp_config' THEN
+        OLD.access_token IS NOT NULL OR OLD.verify_token IS NOT NULL OR
+        OLD.provider_config ->> 'apiKey' IS NOT NULL OR
+        OLD.provider_config ->> 'secret' IS NOT NULL
+      WHEN 'salesforce_config' THEN
+        OLD.client_id IS NOT NULL OR OLD.client_secret IS NOT NULL OR
+        OLD.username IS NOT NULL OR OLD.password IS NOT NULL OR
+        OLD.security_token IS NOT NULL OR OLD.webhook_secret IS NOT NULL
+      WHEN 'ai_configs' THEN
+        OLD.api_key IS NOT NULL OR OLD.embeddings_api_key IS NOT NULL
+      WHEN 'webhook_endpoints' THEN OLD.secret IS NOT NULL
+      ELSE FALSE
+    END;
+    IF encrypted_value_changed THEN
+      PERFORM public.lock_key_rotation_account(OLD.account_id);
+    END IF;
+    RETURN OLD;
+  END IF;
+
+  -- An encrypted row may move between accounts. Both inventories must be under
+  -- the barrier, acquired in deterministic order, so a transfer can never race
+  -- a rotation or finalization of either account.
+  IF NEW.account_id IS DISTINCT FROM OLD.account_id THEN
+    PERFORM public.lock_key_rotation_accounts(
+      ARRAY[OLD.account_id, NEW.account_id]
+    );
   END IF;
 
   encrypted_value_changed := CASE TG_TABLE_NAME
@@ -186,16 +250,16 @@ $$;
 ALTER FUNCTION public.bump_key_rotation_secret_metadata() OWNER TO key_rotation_executor;
 
 CREATE TRIGGER whatsapp_config_secret_metadata
-  BEFORE INSERT OR UPDATE ON whatsapp_config
+  BEFORE INSERT OR UPDATE OR DELETE ON whatsapp_config
   FOR EACH ROW EXECUTE FUNCTION public.bump_key_rotation_secret_metadata();
 CREATE TRIGGER salesforce_config_secret_metadata
-  BEFORE INSERT OR UPDATE ON salesforce_config
+  BEFORE INSERT OR UPDATE OR DELETE ON salesforce_config
   FOR EACH ROW EXECUTE FUNCTION public.bump_key_rotation_secret_metadata();
 CREATE TRIGGER ai_configs_secret_metadata
-  BEFORE INSERT OR UPDATE ON ai_configs
+  BEFORE INSERT OR UPDATE OR DELETE ON ai_configs
   FOR EACH ROW EXECUTE FUNCTION public.bump_key_rotation_secret_metadata();
 CREATE TRIGGER webhook_endpoints_secret_metadata
-  BEFORE INSERT OR UPDATE ON webhook_endpoints
+  BEFORE INSERT OR UPDATE OR DELETE ON webhook_endpoints
   FOR EACH ROW EXECUTE FUNCTION public.bump_key_rotation_secret_metadata();
 
 -- One closed, non-dynamic inventory implementation is reused by snapshot and
@@ -615,6 +679,8 @@ RETURNS VOID
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, public
+SET lock_timeout = '8s'
+SET statement_timeout = '30s'
 AS $$
 BEGIN
   IF auth.role() IS DISTINCT FROM 'service_role' THEN
@@ -916,6 +982,8 @@ RETURNS TABLE (
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, public
+SET lock_timeout = '8s'
+SET statement_timeout = '30s'
 AS $$
 DECLARE
   v_operations_enabled BOOLEAN;
@@ -1012,26 +1080,11 @@ BEGIN
     RETURN;
   END IF;
 
-  IF v_run_mode IS DISTINCT FROM 'apply' THEN
-    PERFORM public.reject_key_rotation_item(
-      p_run_id, p_item_id, v_account_id, 'mode_read_only'
-    );
-    RETURN QUERY SELECT
-      'rejected'::TEXT, v_account_id, NULL::BIGINT, NULL::UUID,
-      'mode_read_only'::TEXT;
-    RETURN;
-  END IF;
-
-  IF v_run_status IS DISTINCT FROM 'running' THEN
-    PERFORM public.reject_key_rotation_item(
-      p_run_id, p_item_id, v_account_id, 'approval_required'
-    );
-    RETURN QUERY SELECT
-      'rejected'::TEXT, v_account_id, NULL::BIGINT, NULL::UUID,
-      'approval_required'::TEXT;
-    RETURN;
-  END IF;
-
+  -- Idempotent replay is checked before any terminal state rejection: a
+  -- transient failure or a crash after the row was applied but before the
+  -- audit event was written must resolve to 'already_applied' even when the
+  -- run is no longer in 'running'/'apply' mode. Otherwise every retry would
+  -- misreport a fully-applied item as rejected.
   v_payload_digest := extensions.digest(
     convert_to(p_values::TEXT, 'UTF8'),
     'sha256'
@@ -1085,6 +1138,26 @@ BEGIN
       'already_applied'::TEXT
     FROM public.rotation_items i
     WHERE i.run_id = p_run_id AND i.id = p_item_id;
+    RETURN;
+  END IF;
+
+  IF v_run_mode IS DISTINCT FROM 'apply' THEN
+    PERFORM public.reject_key_rotation_item(
+      p_run_id, p_item_id, v_account_id, 'mode_read_only'
+    );
+    RETURN QUERY SELECT
+      'rejected'::TEXT, v_account_id, NULL::BIGINT, NULL::UUID,
+      'mode_read_only'::TEXT;
+    RETURN;
+  END IF;
+
+  IF v_run_status IS DISTINCT FROM 'running' THEN
+    PERFORM public.reject_key_rotation_item(
+      p_run_id, p_item_id, v_account_id, 'approval_required'
+    );
+    RETURN QUERY SELECT
+      'rejected'::TEXT, v_account_id, NULL::BIGINT, NULL::UUID,
+      'approval_required'::TEXT;
     RETURN;
   END IF;
 
@@ -1728,6 +1801,8 @@ RETURNS VOID
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, public
+SET lock_timeout = '8s'
+SET statement_timeout = '30s'
 AS $$
 BEGIN
   IF auth.role() IS DISTINCT FROM 'service_role' THEN
@@ -1760,6 +1835,8 @@ RETURNS UUID
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, public
+SET lock_timeout = '8s'
+SET statement_timeout = '30s'
 AS $$
 DECLARE
   v_run_id UUID;
@@ -1822,6 +1899,8 @@ RETURNS TABLE (outcome TEXT, reason_code TEXT)
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, public
+SET lock_timeout = '8s'
+SET statement_timeout = '30s'
 AS $$
 DECLARE
   v_enabled BOOLEAN;
@@ -1918,6 +1997,8 @@ RETURNS TABLE (outcome TEXT, reason_code TEXT)
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, public
+SET lock_timeout = '8s'
+SET statement_timeout = '30s'
 AS $$
 DECLARE
   v_run public.rotation_runs%ROWTYPE;
@@ -2125,6 +2206,8 @@ RETURNS TABLE (
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, public
+SET lock_timeout = '8s'
+SET statement_timeout = '30s'
 AS $$
 DECLARE
   v_enabled BOOLEAN;
@@ -2249,6 +2332,8 @@ RETURNS TABLE (outcome TEXT, reason_code TEXT)
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, public
+SET lock_timeout = '8s'
+SET statement_timeout = '30s'
 AS $$
 DECLARE
   v_enabled BOOLEAN;

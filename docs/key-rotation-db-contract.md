@@ -35,12 +35,18 @@ Every state-changing RPC follows this transaction-scoped order:
 **control → account barrier → run → item → encrypted row**
 
 The control row serializes emergency state changes. An account-scoped advisory
-lock is the secret-write barrier. Insert and update triggers acquire it only for
-allow-listed encrypted values; unrelated JSONB properties do not acquire it.
-Preparation, rotation, finalization, and retirement acquire it before run/item
-locks. Run locks serialize lifecycle changes, item locks serialize retries, and
-the final `UPDATE` takes the encrypted-row lock. Account barrier acquisition has
-a five-second lock timeout; CI concurrency sessions also use bounded statement
+lock is the secret-write barrier. Insert, update, and delete triggers acquire it
+only for allow-listed encrypted values; unrelated JSONB properties do not
+acquire it. Deleting an encrypted row acquires the barrier for the row's
+account, and moving an encrypted row to another account acquires both account
+locks in sorted, deterministic order so transfers can never deadlock or race a
+rotation of either account. Preparation, rotation, finalization, and retirement
+acquire it before run/item locks. Run locks serialize lifecycle changes, item
+locks serialize retries, and the final `UPDATE` takes the encrypted-row lock.
+Every state-changing RPC bounds the whole mutating transaction with an
+eight-second lock timeout and a thirty-second statement timeout, so emergency
+disable and its peers always fail fast and recoverably instead of parking on a
+blocked peer. CI concurrency sessions additionally use bounded statement
 timeouts. No code may acquire these locks in reverse order.
 
 ## Mode contract
@@ -88,8 +94,10 @@ immutable and every later correction must use a new additive migration.
 - Identical canonical manifest imports return the existing revision and preserve
   its approval. Only changed canonical evidence creates a revision and requires
   new approval.
-- Applied replay locks and revalidates current row metadata. A changed row is a
-  conflict, never `already_applied`.
+- Applied replay runs before any terminal-state rejection and revalidates
+  current row metadata. A changed row is a conflict, never `already_applied`;
+  a matching replay returns `already_applied` even after the run has left the
+  `running`/`apply` state.
 - Empty accounts can prepare, start, and finalize read-only runs entirely through
   public RPCs without inserting internal evidence rows.
 - Monitoring discovers active/stuck runs and aggregate failures; detailed
