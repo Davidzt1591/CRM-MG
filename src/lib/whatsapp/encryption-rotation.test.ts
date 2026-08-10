@@ -87,6 +87,33 @@ describe('key rotation (reEncrypt)', () => {
       // Four-part blob — too many colons.
       expect(() => reEncrypt('aa:bb:cc:dd')).toThrow();
     });
+
+    it('requires explicit previous-key ownership before rotating legacy CBC', async () => {
+      const iv = crypto.randomBytes(16);
+      const cipher = crypto.createCipheriv(
+        'aes-256-cbc',
+        Buffer.from(KEY_B, 'hex'),
+        iv,
+      );
+      const ciphertext = Buffer.concat([
+        cipher.update('legacy-previous-key', 'utf8'),
+        cipher.final(),
+      ]);
+      const legacy = `${iv.toString('hex')}:${ciphertext.toString('hex')}`;
+
+      process.env.ENCRYPTION_KEY_PREVIOUS = KEY_B;
+      vi.resetModules();
+      const modCurrent = await module();
+
+      expect(() => modCurrent.decrypt(legacy)).toThrow(/ownership/i);
+      expect(() => modCurrent.reEncrypt(legacy)).toThrow(/ownership/i);
+      const rotated = modCurrent.reEncrypt(legacy, { legacyKey: 'previous' });
+
+      delete process.env.ENCRYPTION_KEY_PREVIOUS;
+      vi.resetModules();
+      const currentOnly = await module();
+      expect(currentOnly.decrypt(rotated)).toBe('legacy-previous-key');
+    });
   });
 
   describe('transparent fallback (decrypt with previous key)', () => {

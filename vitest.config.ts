@@ -17,5 +17,8 @@ export default defineConfig({
       META_APP_SECRET: "test-meta-app-secret",
     },
     clearMocks: true,
+    // Fail the run when a test.only/describe.only is committed so CI cannot
+    // green on a partial suite accidentally left behind during development.
+    allowOnly: false,
   },
 });
